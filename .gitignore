@@ -1,0 +1,15 @@
+﻿__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+data/
+logs/
+backups/
+*.bak*
+*.nohup
+*.out
+*.log
+*.jsonl
+*.zip
+node_modules/

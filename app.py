@@ -154,6 +154,24 @@ class AttemptNetworkContext:
         self._sessions.clear()
 
 
+def approval_session_candidates(
+    provider: str,
+    promo_requested: bool,
+    single_chain: bool,
+    *,
+    exit_proxy: str,
+    checkout_proxy: str,
+    checkout_http: object,
+    provider_http: object,
+) -> list[tuple[str, object, str]]:
+    """Pair every approval HTTP session with the proxy that created it."""
+    candidates: list[tuple[str, object, str]] = []
+    if provider == "upi" and promo_requested and not single_chain:
+        candidates.append((exit_proxy, provider_http, "IN 支付 Session"))
+    candidates.append((checkout_proxy, checkout_http, "Checkout 创建 Session"))
+    return candidates
+
+
 def _decode_jwt(token: str) -> dict:
     try:
         part = token.split(".")[1]
@@ -403,12 +421,20 @@ def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
     options["currency"] = currency
     options["checkout_currency"] = currency
     billing = {"country": country, "currency": currency}
+    link_type = str(options.get("link_type") or "hosted")
+    # Prefer custom UI so OpenAI returns a real Stripe cs_live_* for Payment Page.
+    # Hosted/redirect often yields only oaicss_* which Stripe API rejects.
+    # On UPI zero-due, still use custom; promo may be attached via promo_on_create.
+    if link_type != "hosted" or plan == "codex_low":
+        ui_mode = "custom"
+    else:
+        ui_mode = "redirect"
     common: dict[str, Any] = {
         "entry_point": "all_plans_pricing_modal",
         "plan_name": PLANS[plan],
         "billing_details": billing,
         "cancel_url": "https://chatgpt.com/",
-        "checkout_ui_mode": "custom" if options["link_type"] != "hosted" or plan == "codex_low" else "redirect",
+        "checkout_ui_mode": ui_mode,
         "check_card_proxy": True,
     }
     promo = options.get("promo_campaign", "").strip()
@@ -475,11 +501,76 @@ def create_checkout(token: str, payload: dict, proxy: str, device_id: str, did: 
         data = resp.json()
     except Exception:
         raise RuntimeError(f"OpenAI Checkout 返回非 JSON：{text[:300]}")
-    sid = data.get("checkout_session_id") or ""
-    url = data.get("url") or ""
-    if not sid and url:
-        match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", url)
-        sid = match.group(0) if match else ""
+    sid = str(data.get("checkout_session_id") or "")
+    url = str(
+        data.get("url")
+        or data.get("checkout_url")
+        or data.get("redirect_url")
+        or data.get("checkout_link")
+        or ""
+    )
+    # Also scan nested checkout_session objects (custom vs hosted variants).
+    nested = data.get("checkout_session") if isinstance(data.get("checkout_session"), dict) else {}
+    if not sid:
+        sid = str(nested.get("checkout_session_id") or nested.get("id") or "")
+    if not url:
+        url = str(nested.get("url") or nested.get("checkout_url") or "")
+    # Hosted/zero-due responses sometimes put an OpenAI-internal oaicss_* id in
+    # checkout_session_id while the real Stripe cs_live_* only appears in url,
+    # nested JSON, or a follow-up pay.openai.com redirect.
+    stripe_sid = ""
+    blob_sources = [url, text, sid, json.dumps(data, ensure_ascii=False, default=str)]
+    for source in blob_sources:
+        match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", str(source or ""))
+        if match:
+            stripe_sid = match.group(0)
+            break
+    tag = str(data.get("tag") or (nested.get("tag") if isinstance(nested, dict) else "") or "")
+    ui_mode_resp = str(
+        data.get("checkout_ui_mode")
+        or (nested.get("checkout_ui_mode") if isinstance(nested, dict) else "")
+        or payload.get("checkout_ui_mode")
+        or ""
+    )
+    if not stripe_sid and (url or sid.startswith("oaics_")):
+        # Hosted/redirect SPA pages rarely embed cs_live in static HTML.
+        # Quick probe only when a url is present; oaicss-without-url fails fast.
+        probe_urls: list[str] = []
+        if url:
+            probe_urls.append(url)
+        if sid.startswith("oaics_") and url:
+            probe_urls.append(f"https://pay.openai.com/c/pay/{sid}")
+        if probe_urls:
+            log(
+                f"Checkout 仅有 oaicss/无 cs_live，尝试落地解析 tag={tag or '-'} "
+                f"ui={ui_mode_resp or '-'} url=yes probes={len(probe_urls)}"
+            )
+        for probe in probe_urls[:2]:
+            try:
+                probe_resp = http.get(
+                    probe,
+                    headers={"User-Agent": sc.CHROME_UA, "Accept": "text/html,application/json"},
+                    timeout=12,
+                    allow_redirects=True,
+                )
+                final_url = str(getattr(probe_resp, "url", "") or "")
+                probe_text = f"{final_url} {getattr(probe_resp, 'text', '') or ''}"
+                match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", probe_text)
+                if match:
+                    stripe_sid = match.group(0)
+                    log(f"Checkout 从落地页解析到 Stripe 会话：{stripe_sid[:28]}…")
+                    break
+            except Exception as exc:  # noqa: BLE001
+                log(f"Checkout oaicss 落地解析提示：{type(exc).__name__}: {exc}")
+    if stripe_sid:
+        sid = stripe_sid
+    elif sid.startswith("oaics_"):
+        # Keep a clear failure path rather than feeding oaicss into Stripe.
+        raise RuntimeError(
+            f"OpenAI Checkout 未返回 Stripe cs_live 会话（仅有 {sid}；"
+            f"tag={tag or '-'} ui={ui_mode_resp or '-'}），"
+            "请换代理并以 custom 无 promo 创建后 checkout/update 优惠"
+        )
     if not sid:
         match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", text)
         sid = match.group(0) if match else ""
@@ -771,8 +862,12 @@ def approve_checkout(
         # manual approval asynchronously. Do not discard the zero-amount
         # Payment Page immediately; let the caller poll Stripe for the actual
         # next_action/QR and fail only if no provider result appears.
-        if result == "exception":
-            log("[stripe] manual_approval approve returned exception; continuing Stripe poll")
+        if result in {"exception", "blocked"}:
+            log(
+                f"[stripe] manual_approval approve returned {result}; "
+                "continuing Stripe poll / recovery"
+            )
+            payload["_approve_soft_fail"] = result
             return payload
         raise RuntimeError(f"manual_approval approve blocked: result={result}")
     return payload
@@ -1113,19 +1208,18 @@ class JobStore:
                 # existing cross-entry checkout/update flow as a fallback.
                 current["promo_on_create"] = bool((attempt - 1) % 2 == 0)
             if current.get("link_type") in {"pix", "upi"}:
-                # Alternate both Stripe submission shapes across outer retries.
-                # Some Checkout revisions accept a pre-created pm_* while
-                # others only complete the local mandate with inline data.
-                strategy_cycle = (
-                    ("standalone", "late_promo", "inline")
-                    if current.get("link_type") == "pix"
-                    else ("standalone", "inline", "late_promo")
-                )
+                # Keep PIX's adaptive shapes; UPI uses one native Hosted shape.
+                if current.get("link_type") == "pix":
+                    strategy_cycle = ("standalone", "late_promo", "inline")
+                    current["promo_on_create"] = False
+                else:
+                    # Create the zero-due UPI Checkout natively on the fixed IN
+                    # Session. Continue only when init exposes the merchant-owned
+                    # AutoPay mandate; otherwise return the Hosted fallback.
+                    strategy_cycle = ("hosted_minimal",)
+                    current["promo_on_create"] = True
+                    current["upi_create_on_promo_entry"] = False
                 current["local_method_strategy"] = strategy_cycle[(attempt - 1) % len(strategy_cycle)]
-                # Creating the Checkout at zero due removes PIX/UPI from this
-                # merchant's payment_method_types, so local methods keep the
-                # mid-flight promotion flow.
-                current["promo_on_create"] = False
             if current.get("link_type") == "pix" and current.get("pix_tax_id_auto"):
                 auto_kind = current.get("pix_auto_kind") or "cpf"
                 kind = ("cpf" if attempt % 2 else "cnpj") if auto_kind == "mixed" else auto_kind
@@ -1140,6 +1234,17 @@ class JobStore:
             if current.get("link_type") == "paypal" and current.get("use_promo"):
                 strategy = "Checkout 创建时原生带优惠" if current.get("promo_on_create") else "创建后通过入口线路更新优惠"
                 self.log(job_id, f"PayPal 优惠策略：{strategy}")
+            if current.get("link_type") == "upi" and current.get("use_promo"):
+                strategy = (
+                    "IN 支付 Session 创建时原生带优惠"
+                    if current.get("promo_on_create")
+                    else "创建后 JP 入口更新优惠"
+                )
+                self.log(
+                    job_id,
+                    f"UPI 0 元 AutoPay 策略：{strategy}；提交形态={current.get('local_method_strategy')}；"
+                    f"create_on_jp={bool(current.get('upi_create_on_promo_entry'))}",
+                )
             self._run_single(job_id, current)
             state = self.get(job_id) or {}
             if state.get("status") in {"done", "cancelled"}:
@@ -1327,6 +1432,10 @@ class JobStore:
             )
             self.update(job_id, percent=34, text=stage2_text)
             checkout_proxy = exit_proxy if provider in {"paypal", "upi", "ideal"} else entry_proxy
+            if provider == "upi" and promo_requested and options.get("upi_create_on_promo_entry"):
+                # JP entry creates the zero-due Checkout; IN Session owns Stripe
+                # confirm/approve/QR extraction.
+                checkout_proxy = entry_proxy
             if provider == "pix":
                 self.log(
                     job_id,
@@ -1336,7 +1445,13 @@ class JobStore:
             elif provider == "paypal" and promo_requested:
                 self.log(job_id, f"PayPal 设置：代理池 1 用于优惠检查，代理池 2 创建 {country}/{options['currency']} Checkout")
             elif provider == "upi":
-                self.log(job_id, "UPI 设置：优惠检查、IN/INR Checkout 与 Stripe 全部使用同一真实 Session")
+                if promo_requested and options.get("upi_create_on_promo_entry"):
+                    self.log(
+                        job_id,
+                        "UPI 动态 IP：JP 入口创建/优惠 Checkout；IN 账单 + IN Session 做 Stripe/提链",
+                    )
+                else:
+                    self.log(job_id, "UPI 设置：优惠检查、IN/INR Checkout 与 Stripe 全部使用同一真实 Session")
             elif provider == "ideal":
                 self.log(job_id, "iDEAL 设置：NL/EUR Checkout、优惠更新与 Stripe 全部使用同一真实 Session")
             elif provider != "hosted":
@@ -1370,7 +1485,21 @@ class JobStore:
                 if provider == "paypal":
                     self.log(job_id, f"PayPal 支付处理使用代理池 2（{country}）")
                 elif provider == "upi":
-                    self.log(job_id, "UPI 支付处理继续复用同一 IN Session")
+                    if promo_requested and options.get("upi_create_on_promo_entry"):
+                        # Checkout cookies were collected on JP create Session.
+                        # Keep approval candidates able to use either Session.
+                        provider_chatgpt_http = exit_http
+                        try:
+                            provider_chatgpt_http.cookies.set("oai-did", did, domain="chatgpt.com")
+                            for cookie_name, cookie_value in chatgpt_http.cookies.get_dict().items():
+                                provider_chatgpt_http.cookies.set(
+                                    cookie_name, cookie_value, domain="chatgpt.com",
+                                )
+                        except Exception as exc:
+                            self.log(job_id, f"UPI IN Session cookie 同步提示：{type(exc).__name__}")
+                        self.log(job_id, "UPI Stripe/提链使用 IN Session；优惠/创建在 JP 入口")
+                    else:
+                        self.log(job_id, "UPI 支付处理继续复用同一 IN Session")
                 else:
                     self.log(job_id, "iDEAL 优惠更新与 Stripe 继续复用同一 NL Session")
             session_id = checkout_data.get("checkout_session_id") or ""
@@ -1605,27 +1734,47 @@ class JobStore:
             def approve_cb(processor: str):
                 self.ensure_not_cancelled(job_id)
                 advance_progress(90, "正在确认支付请求")
-                approval_proxy = checkout_proxy
-                approval_http = provider_chatgpt_http
-                if provider == "upi" and promo_requested and not single_chain:
-                    # ChatGPT approval is a merchant/backend eligibility action,
-                    # so keep it on the same JP entry Session that performed the
-                    # promo update. Stripe/UPI traffic remains on the IN payment
-                    # Session through `stripe_http` above.
-                    approval_proxy = entry_proxy
-                    approval_http = promo_chatgpt_http
-                    self.log(job_id, "UPI approval 改用优惠入口 JP Session")
-                self.log(job_id, "提交 Checkout approval")
-                approve_checkout(
-                    token,
-                    session_id,
-                    processor,
-                    approval_proxy,
-                    device_id,
-                    did,
-                    http=approval_http,
-                    log=provider_log,
+                # Approval stays on the payment/creation Sessions. The JP promo
+                # Session never owns the Stripe submission and is not a valid
+                # fingerprint match for approval.
+                candidates = approval_session_candidates(
+                    provider,
+                    promo_requested,
+                    single_chain,
+                    exit_proxy=exit_proxy,
+                    checkout_proxy=checkout_proxy,
+                    checkout_http=chatgpt_http,
+                    provider_http=provider_chatgpt_http,
                 )
+                seen: set[tuple[str, int]] = set()
+                last_payload: dict = {}
+                for approval_proxy, approval_http, label in candidates:
+                    key = (str(approval_proxy or ""), id(approval_http))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    self.log(job_id, f"提交 Checkout approval（{label}）")
+                    last_payload = approve_checkout(
+                        token,
+                        session_id,
+                        processor,
+                        approval_proxy,
+                        device_id,
+                        did,
+                        http=approval_http,
+                        log=provider_log,
+                    )
+                    result = str((last_payload or {}).get("result") or "").lower()
+                    soft = str((last_payload or {}).get("_approve_soft_fail") or "").lower()
+                    if result in {"", "approved"} and not soft:
+                        self.log(job_id, f"Checkout approval 已通过（{label}）")
+                        break
+                    if soft == "blocked" and label != candidates[-1][2]:
+                        self.log(job_id, f"Checkout approval {soft}（{label}），切换下一 Session 重试")
+                        continue
+                    if soft == "exception":
+                        self.log(job_id, f"Checkout approval exception（{label}），交 Stripe poll 确认")
+                        break
                 self.ensure_not_cancelled(job_id)
 
             def apply_promo_cb(processor: str):
@@ -1685,6 +1834,21 @@ class JobStore:
             if provider_result.get("checkout_currency"):
                 result["currency"] = str(provider_result["checkout_currency"]).upper()
                 result["checkout_currency"] = result["currency"]
+            if provider == "upi":
+                mandate_source = str(provider_result.get("upi_mandate_source") or "")
+                if provider_result.get("fallback_reason"):
+                    self.log(
+                        job_id,
+                        f"UPI 结果：官方 Checkout fallback，"
+                        f"mandate={mandate_source or 'n/a'}，"
+                        f"原因={provider_result.get('fallback_reason')}",
+                    )
+                elif mandate_source:
+                    self.log(
+                        job_id,
+                        f"UPI AutoPay mandate 来源={mandate_source}，"
+                        f"available={bool(provider_result.get('upi_mandate_available'))}",
+                    )
             done_text = "第 7/7 步：PIX 二维码生成完成" if provider == "pix" else (
                 "第 7/7 步：PayPal agreements/approve 链接生成完成" if provider == "paypal" else f"{provider.upper()} 提取完成"
             )

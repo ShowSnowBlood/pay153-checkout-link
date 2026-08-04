@@ -399,6 +399,41 @@ def init_checkout(http, session_id: str, pk: str, profile: dict, log) -> tuple[d
                 "stripe_hosted_url": init_data.get("stripe_hosted_url") or "",
             }
             log(f"[stripe] init ok version={version[:24]} amount={amount} currency={ctx['currency']} pm={ctx['payment_method_types']}")
+            # Record passive hCaptcha switches when present. Config existence
+            # does not prove confirm requires a token — probes correlate later.
+            feature_flags = init_data.get("feature_flags") if isinstance(init_data.get("feature_flags"), dict) else {}
+            link_settings = init_data.get("link_settings") if isinstance(init_data.get("link_settings"), dict) else {}
+            captcha_flags = {
+                key: feature_flags.get(key)
+                for key in (
+                    "checkout_passive_captcha",
+                    "checkout_enable_link_api_passive_hcaptcha",
+                    "checkout_enable_link_api_hcaptcha_rqdata",
+                    "checkout_enable_hcaptcha_async_token_logging",
+                    "checkout_hcaptcha_redundancy_control_enabled",
+                )
+                if key in feature_flags
+            }
+            if captcha_flags:
+                rq = str(
+                    link_settings.get("hcaptcha_rqdata")
+                    or link_settings.get("hcaptcha_nqdata")
+                    or ""
+                )
+                site_key = str(
+                    link_settings.get("hcaptcha_site_key")
+                    or init_data.get("site_key")
+                    or ""
+                )
+                ctx["captcha_flags"] = captcha_flags
+                ctx["hcaptcha_site_key"] = site_key
+                ctx["hcaptcha_rqdata_len"] = len(rq)
+                log(
+                    "[stripe] captcha flags "
+                    + ",".join(f"{k}={v}" for k, v in captcha_flags.items())
+                    + f" site_key={site_key[:18] + '…' if site_key else '-'} "
+                    + f"rqdata_len={len(rq)}"
+                )
             if str(amount).strip() in {"0", "0.0", "0.00"}:
                 # Keep the fields that decide whether Checkout is confirming a
                 # PaymentIntent or a SetupIntent.  These are deliberately

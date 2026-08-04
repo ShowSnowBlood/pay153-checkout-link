@@ -161,7 +161,20 @@ function showResult(result){
   $('resultType').textContent = `${String(result.plan||'').toUpperCase()} · ${String(result.link_type||'').toUpperCase()}`;
   $('resultEmail').textContent = result.account_email || '—';
   $('resultRegion').textContent = `${result.country || '—'} / ${result.currency || '—'}`;
-  $('resultPromo').textContent = !result.promo_requested ? '未请求' : result.promo_applied === true ? '已生效 · 今日应付 0' : result.promo_applied === false ? '未生效' : '打开结账页确认';
+  let promoText = !result.promo_requested
+    ? '未请求'
+    : result.promo_applied === true
+      ? '已生效 · 今日应付 0'
+      : result.promo_applied === false
+        ? '未生效'
+        : '打开结账页确认';
+  if (String(result.link_type || '').toLowerCase() === 'upi') {
+    const mandateSource = String(result.upi_mandate_source || '').toLowerCase();
+    if (mandateSource === 'local') promoText += ' · AutoPay 本地补全';
+    else if (mandateSource === 'server') promoText += ' · AutoPay 服务端';
+    if (result.fallback_reason) promoText += ' · 官方页兜底';
+  }
+  $('resultPromo').textContent = promoText;
   $('resultSession').textContent = result.checkout_session_id || '—';
   const finalValue = result.qr_data || result.provider_redirect_url || result.checkout_url || '';
   $('resultValue').value = finalValue;

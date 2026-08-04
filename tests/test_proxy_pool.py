@@ -222,6 +222,65 @@ class AttemptNetworkContextTests(unittest.TestCase):
         session.close.assert_called_once_with()
 
 
+class ApprovalSessionCandidateTests(unittest.TestCase):
+    def test_upi_dual_region_keeps_proxy_and_http_session_paired(self) -> None:
+        from app import approval_session_candidates
+
+        checkout_http = object()
+        provider_http = object()
+        promo_http = object()
+        candidates = approval_session_candidates(
+            "upi",
+            True,
+            False,
+            exit_proxy="http://in-exit",
+            checkout_proxy="http://jp-entry",
+            checkout_http=checkout_http,
+            provider_http=provider_http,
+        )
+
+        self.assertEqual(candidates[0][:1], ("http://in-exit",))
+        self.assertIs(candidates[0][1], provider_http)
+        self.assertEqual(candidates[1][:1], ("http://jp-entry",))
+        self.assertIs(candidates[1][1], checkout_http)
+        self.assertNotIn(promo_http, [item[1] for item in candidates])
+
+    def test_single_chain_approval_uses_original_checkout_session(self) -> None:
+        from app import approval_session_candidates
+
+        checkout_http = object()
+        candidates = approval_session_candidates(
+            "upi",
+            True,
+            True,
+            exit_proxy="http://in-sticky",
+            checkout_proxy="http://in-sticky",
+            checkout_http=checkout_http,
+            provider_http=object(),
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0][0], "http://in-sticky")
+        self.assertIs(candidates[0][1], checkout_http)
+
+    def test_upi_promo_on_create_is_included_in_checkout_payload(self) -> None:
+        from app import checkout_payload
+
+        options = {
+            "plan": "plus",
+            "country": "IN",
+            "currency": "INR",
+            "link_type": "upi",
+            "use_promo": True,
+            "promo_on_create": True,
+            "promo_campaign": "plus-1-month-free",
+        }
+        payload = checkout_payload(options, {})
+        self.assertEqual(
+            payload["promo_campaign"]["promo_campaign_id"],
+            "plus-1-month-free",
+        )
+
+
 class ProxyLeaseRegistryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()

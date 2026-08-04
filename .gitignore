@@ -13,3 +13,5 @@ backups/
 *.jsonl
 *.zip
 node_modules/
+artifacts/tmp/
+screenshots/

@@ -1128,10 +1128,23 @@ def stripe_to_provider(
                     else None
                 ) or {}
                 if not isinstance(upi_options, dict) or not upi_options.get("mandate_options"):
-                    raise RuntimeError(
-                        "当前 Checkout 未开放 UPI 0 元 mandate；已停止提交无效 SetupIntent。"
-                        "UPI 仅在 Stripe 返回 mandate_options 时继续生成。"
+                    log(
+                        "[upi] Checkout 已归零，但 Stripe 未返回 UPI 0 元 mandate；"
+                        "返回官方 0 元 Checkout fallback"
                     )
+                    return {
+                        "provider": provider,
+                        "provider_redirect_url": f"https://pay.openai.com/c/pay/{session_id}",
+                        "payment_method_types": ctx.get("payment_method_types") or methods,
+                        "processor_entity": processor,
+                        "stripe_publishable_key": pk,
+                        "checkout_amount": checkout_amount,
+                        "checkout_currency": str(ctx.get("currency") or "").upper(),
+                        "promo_requested": require_zero_due,
+                        "promo_applied": True,
+                        "upi_mandate_available": False,
+                        "fallback_reason": "zero_due_without_upi_mandate",
+                    }
             if provider == "pix":
                 log("[promo] 第 5/7 步：返回 BR 主链路并校验通过，Stripe 今日应付 amount=0")
             else:
@@ -1275,6 +1288,18 @@ def stripe_to_provider(
     if not out.get("provider_redirect_url") and not out.get("qr_image_png") and not out.get("qr_data"):
         decline = payment_decline(confirm)
         failure_detail = provider_failure_detail(confirm)
+        if provider == "upi" and require_zero_due and promo_applied:
+            log(
+                "[upi] Stripe 未产出 UPI QR/跳转，但 Checkout 已归零；"
+                "返回官方 0 元 Checkout fallback"
+            )
+            out.update({
+                "provider": provider,
+                "provider_redirect_url": f"https://pay.openai.com/c/pay/{session_id}",
+                "upi_mandate_available": False,
+                "fallback_reason": failure_detail or "zero_due_without_upi_result",
+            })
+            return out
         if decline or failure_detail:
             raise RuntimeError(
                 f"{provider} 支付通道拒绝："

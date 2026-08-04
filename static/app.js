@@ -100,7 +100,7 @@ function syncFields(applyRailDefault=false){
     pix: '推荐代理：代理池 1 使用 BR。'
   };
   const pool2Hints = {paypal:'巴西 PayPal 推荐 BR',ideal:'推荐 NL',upi:'推荐 IN'};
-  const recommendation = recommendations[rail] || '推荐代理：使用与所选地区一致的代理。';
+  const recommendation = `${recommendations[rail] || '推荐代理：使用与所选地区一致的代理。'} 动态网关可用 __rotate__，任务会先深度探测再固定 session。`;
   $('proxyRecommendation').textContent = recommendation;
   $('proxyFootHint').textContent = recommendation;
   $('exitProxyHint').textContent = pool2Hints[rail] || '推荐同地区';

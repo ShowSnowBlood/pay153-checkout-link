@@ -22,6 +22,7 @@ from curl_cffi import requests
 
 import stripe_checkout as sc
 from provider_checkout import PROVIDER_DEFAULTS, default_billing, stripe_to_provider
+from proxy_pool import OPTIMIZER, ProxyProbe
 from sentinel_token import SentinelTokenProvider as BaseSentinel
 
 
@@ -115,11 +116,40 @@ class ProxySentinel(BaseSentinel):
 
     async def _get_session(self):
         if not self._session:
-            kwargs: dict[str, Any] = {"impersonate": "chrome", "timeout": 70}
+            kwargs: dict[str, Any] = {"impersonate": "chrome136", "timeout": 70}
             if self.proxy:
                 kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
             self._session = requests.AsyncSession(**kwargs)
         return self._session
+
+
+class AttemptNetworkContext:
+    """Keep one TLS/cookie session per concrete proxy for a complete attempt."""
+
+    def __init__(self, entry_proxy: str, exit_proxy: str, device_id: str, did: str):
+        self.entry_proxy = entry_proxy
+        self.exit_proxy = exit_proxy
+        self.device_id = device_id
+        self.did = did
+        self._sessions: dict[str, Any] = {}
+
+    def http(self, proxy: str):
+        if proxy not in self._sessions:
+            session = sc.build_http(proxy or None)
+            try:
+                session.cookies.set("oai-did", self.did, domain="chatgpt.com")
+            except Exception:
+                pass
+            self._sessions[proxy] = session
+        return self._sessions[proxy]
+
+    def close(self) -> None:
+        for session in self._sessions.values():
+            try:
+                session.close()
+            except Exception:
+                pass
+        self._sessions.clear()
 
 
 def _decode_jwt(token: str) -> dict:
@@ -392,8 +422,8 @@ def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
     return common
 
 
-def create_checkout(token: str, payload: dict, proxy: str, device_id: str, did: str, log) -> dict:
-    http = sc.build_http(proxy or None)
+def create_checkout(token: str, payload: dict, proxy: str, device_id: str, did: str, log, *, http=None) -> dict:
+    http = http or sc.build_http(proxy or None)
     try:
         http.cookies.set("oai-did", did, domain="chatgpt.com")
     except Exception:
@@ -436,10 +466,12 @@ def create_checkout(token: str, payload: dict, proxy: str, device_id: str, did: 
     return {"data": data, "http": http}
 
 
-def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_id: str, did: str, log) -> dict:
+def preflight_trial_eligibility(
+    token: str, account_id: str, proxy: str, device_id: str, did: str, log, *, http=None,
+) -> dict:
     if not account_id:
         return {}
-    http = sc.build_http(proxy)
+    http = http or sc.build_http(proxy)
     try:
         http.cookies.set("oai-did", did, domain="chatgpt.com")
     except Exception:
@@ -541,6 +573,13 @@ def proxy_geo(proxy: str) -> dict[str, str]:
 
 _PROXY_GEO_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
 _PROXY_GEO_CACHE_LOCK = threading.Lock()
+
+
+def cache_proxy_probe(probe: ProxyProbe) -> None:
+    if not probe.country:
+        return
+    with _PROXY_GEO_CACHE_LOCK:
+        _PROXY_GEO_CACHE[probe.proxy_url] = (time.time(), probe.geo())
 
 
 def proxy_geo_cached(proxy: str, ttl: int = 900) -> dict[str, str]:
@@ -941,20 +980,52 @@ class JobStore:
             current["retry_wrapper"] = True
             entry_pool = current["entry_proxies"]
             exit_pool = current.get("exit_proxies") or entry_pool
-            pair = None
-            for _ in range(40):
-                if current.get("link_type") == "pix":
-                    proxy = secrets.choice(entry_pool)
-                    candidate = (proxy, proxy)
+            provider = str(current.get("link_type") or "hosted")
+            expected_exit_country = {"pix": "BR", "upi": "IN", "ideal": "NL"}.get(provider, "")
+            try:
+                entry_probe = OPTIMIZER.select(
+                    entry_pool,
+                    role="入口",
+                    provider=provider,
+                    expected_country="BR" if provider == "pix" else "",
+                    log=lambda message: self.log(job_id, message),
+                )
+                if provider == "pix":
+                    exit_probe = entry_probe
                 else:
-                    candidate = (secrets.choice(entry_pool), secrets.choice(exit_pool))
-                if candidate not in used_pairs or len(used_pairs) >= len(entry_pool) * len(exit_pool):
-                    pair = candidate
-                    break
-            if pair is None:
-                pair = (secrets.choice(entry_pool), secrets.choice(exit_pool))
+                    exit_probe = OPTIMIZER.select(
+                        exit_pool,
+                        role="支付",
+                        provider=provider,
+                        expected_country=expected_exit_country,
+                        log=lambda message: self.log(job_id, message),
+                    )
+            except Exception as exc:
+                message = f"IP 池深度选择失败：{type(exc).__name__}: {exc}"
+                self.log(job_id, message)
+                if attempt < max_attempts:
+                    self.update(
+                        job_id, status="running", percent=4,
+                        text=f"第 {attempt}/{max_attempts} 批 IP 未通过，正在生成下一批",
+                        error=message[:1200],
+                    )
+                    time.sleep(min(3, 0.75 + attempt * 0.25))
+                    continue
+                self.update(job_id, status="error", percent=100, text="任务失败", error=message[:1200])
+                return
+            cache_proxy_probe(entry_probe)
+            cache_proxy_probe(exit_probe)
+            pair = (entry_probe.proxy_url, exit_probe.proxy_url)
             used_pairs.add(pair)
             current["fixed_entry_proxy"], current["fixed_exit_proxy"] = pair
+            current["entry_proxy_probe"] = entry_probe
+            current["exit_proxy_probe"] = exit_probe
+            current["entry_proxy_pool_size"] = len(entry_pool)
+            current["exit_proxy_pool_size"] = len(exit_pool)
+            # Downstream region checks must use the concrete sticky sessions,
+            # never the dynamic template that produced them.
+            current["entry_proxies"] = [entry_probe.proxy_url]
+            current["exit_proxies"] = [exit_probe.proxy_url]
             if current.get("link_type") == "paypal":
                 current["force_paypal_de_fallback"] = paypal_force_de_fallback
                 # Strategy A creates the Checkout with the campaign already
@@ -993,6 +1064,8 @@ class JobStore:
             self._run_single(job_id, current)
             state = self.get(job_id) or {}
             if state.get("status") in {"done", "cancelled"}:
+                if state.get("status") == "done":
+                    OPTIMIZER.report(pair, success=True)
                 if state.get("status") == "done" and isinstance(state.get("result"), dict):
                     result = state["result"]
                     result["attempt"] = attempt
@@ -1006,6 +1079,8 @@ class JobStore:
                 "access token", "token_invalidated", "token_expired", "token_revoked", "jwt expired",
                 "计划类型", "提取方式", "任务已停止",
             ))
+            if not non_retryable:
+                OPTIMIZER.report(pair, success=False, error=last_error)
             if non_retryable or attempt >= max_attempts:
                 self.update(job_id, status="error", percent=100, text="任务失败", error=last_error[:1200])
                 return
@@ -1025,6 +1100,7 @@ class JobStore:
             time.sleep(min(4, 1 + attempt * 0.35))
 
     def _run_single(self, job_id: str, options: dict):
+        network: AttemptNetworkContext | None = None
         try:
             self.update(job_id, status="running", percent=6, text="解析 Access Token")
             token, meta = extract_access_token(options.pop("token_raw"))
@@ -1046,6 +1122,9 @@ class JobStore:
             # use a fresh browser/device identity.  Within this single attempt
             # the same ids are kept for create -> update -> approve.
             device_id, did = str(uuid.uuid4()), str(uuid.uuid4())
+            network = AttemptNetworkContext(entry_proxy, exit_proxy, device_id, did)
+            entry_http = network.http(entry_proxy)
+            exit_http = network.http(exit_proxy)
 
             if provider == "pix":
                 self.update(job_id, percent=9, text="第 1/7 步：选择并检测代理")
@@ -1127,6 +1206,7 @@ class JobStore:
                 preflight = preflight_trial_eligibility(
                     token, meta.get("account_id") or "", entry_proxy, device_id, did,
                     lambda m: self.log(job_id, m),
+                    http=entry_http,
                 )
                 detected_campaign = promo_campaign_from_payload(preflight)
                 if preflight.get("one_click_trial_eligible") is True:
@@ -1166,7 +1246,10 @@ class JobStore:
                 self.log(job_id, "iDEAL 设置：代理池 2 创建 NL/EUR Checkout，并贯穿 Stripe 支付处理")
             elif provider != "hosted":
                 self.log(job_id, f"Checkout 将使用所选的 {country} 地区代理")
-            created = create_checkout(token, payload, checkout_proxy, device_id, did, lambda m: self.log(job_id, m))
+            created = create_checkout(
+                token, payload, checkout_proxy, device_id, did, lambda m: self.log(job_id, m),
+                http=network.http(checkout_proxy),
+            )
             self.ensure_not_cancelled(job_id)
             self.update(job_id, percent=44, text="Checkout 创建完成，正在准备支付方式")
             checkout_data = created["data"]
@@ -1181,7 +1264,7 @@ class JobStore:
             provider_chatgpt_http = chatgpt_http
             promo_chatgpt_http = chatgpt_http
             if provider in {"paypal", "upi", "ideal"}:
-                promo_chatgpt_http = sc.build_http(entry_proxy)
+                promo_chatgpt_http = entry_http
                 try:
                     promo_chatgpt_http.cookies.set("oai-did", did, domain="chatgpt.com")
                     for cookie_name, cookie_value in chatgpt_http.cookies.get_dict().items():
@@ -1212,9 +1295,14 @@ class JobStore:
                 "currency": options["currency"],
                 "checkout_country": options.get("checkout_country") or country,
                 "checkout_currency": options.get("checkout_currency") or options["currency"],
-                "entry_proxy_pool_size": len(entry_pool),
-                "exit_proxy_pool_size": len(exit_pool) if provider not in {"hosted", "pix"} else 0,
+                "entry_proxy_pool_size": int(options.get("entry_proxy_pool_size") or len(entry_pool)),
+                "exit_proxy_pool_size": int(options.get("exit_proxy_pool_size") or len(exit_pool)) if provider not in {"hosted", "pix"} else 0,
                 "proxy_mode": "single_chain" if provider == "pix" else ("entry_only" if provider == "hosted" else "dual_chain"),
+                "entry_exit_ip": getattr(options.get("entry_proxy_probe"), "exit_ip", ""),
+                "entry_proxy_score": getattr(options.get("entry_proxy_probe"), "score", None),
+                "payment_exit_ip": getattr(options.get("exit_proxy_probe"), "exit_ip", ""),
+                "payment_proxy_score": getattr(options.get("exit_proxy_probe"), "score", None),
+                "network_fingerprint": "chrome136/sticky-session",
                 "promo_requested": promo_requested,
                 "promo_applied": None,
                 "promo_campaign_used": options.get("promo_campaign") or "plus-1-month-free",
@@ -1247,7 +1335,7 @@ class JobStore:
                     self.update(job_id, percent=100, text="支付长链生成完成", status="done", result=result)
                     return
 
-                hosted_stripe_http = sc.build_http(entry_proxy)
+                hosted_stripe_http = entry_http
                 hosted_profile = sc._profile(country)
                 hosted_pk = str(checkout_data.get("publishable_key") or "") or sc.verify_pk(
                     hosted_stripe_http, session_id, lambda m: self.log(job_id, m)
@@ -1390,7 +1478,7 @@ class JobStore:
                     elif str(identity.get("source") or "").startswith("generated_"):
                         generated_kind = str(identity.get("source")).removeprefix("generated_").upper()
                         self.log(job_id, f"PIX 本轮已自动生成 {generated_kind}、持有人/企业名称及巴西地址")
-            stripe_http = sc.build_http(exit_proxy)
+            stripe_http = exit_http
 
             progress_mark = 62
 
@@ -1517,6 +1605,9 @@ class JobStore:
                 self.update(job_id, status="running", percent=8, text="本次未成功，正在更换代理重试", error=error_text[:1200])
             else:
                 self.update(job_id, status="error", percent=100, text="任务失败", error=error_text[:1200])
+        finally:
+            if network is not None:
+                network.close()
 
 
 class IpTaskLimiter:

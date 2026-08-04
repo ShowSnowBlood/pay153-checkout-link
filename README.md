@@ -106,6 +106,9 @@ cp .env.example .env
 | `PAY153_IP_RPM` | 单 IP 每分钟任务上限 |
 | `PAY153_LOG_DIR` | 完整后台日志目录 |
 | `PAY153_LEGACY_BASE` | 旧服务兼容地址，可选 |
+| `PAY153_PROXY_PROBE_COUNT` | 每个动态代理池批次生成和探测的候选数，默认 6 |
+| `PAY153_PROXY_PROBE_TIMEOUT` | 单项代理网络探测超时秒数，默认 8 |
+| `PAY153_PROXY_PROBE_TTL` | 固定代理深度探测结果缓存秒数，默认 300 |
 
 ## 代理池
 
@@ -118,7 +121,16 @@ https://username:password@host:port
 socks5://username:password@host:port
 ```
 
-任务提交后会根据支付路径和地区选择代理；代理凭据仅应通过网页或环境变量传入。
+动态网关可以把用户名中的 session 值写成 `__rotate__`：
+
+```text
+http://username-session-__rotate__-lifetime-120:password@gateway:port
+```
+
+每轮任务会生成一批真实 sticky session，并并发验证出口 IP、国家、OpenAI 后端和 Stripe。
+iDEAL 支付出口要求 NL，UPI 要求 IN，PIX 要求 BR；重复出口会去重，失败候选进入指数冷却。
+选中的入口/支付代理会在完整 Checkout 尝试中复用同一 HTTP Session、Cookie、TLS/UA 指纹和设备标识。
+代理凭据仅应通过网页或环境变量传入。
 
 ## 生产部署
 

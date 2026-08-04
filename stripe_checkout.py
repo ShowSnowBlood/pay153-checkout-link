@@ -180,6 +180,15 @@ def build_http(proxy: Optional[str]):
     from curl_cffi.requests import Session as CffiSession
 
     http = CffiSession(impersonate="chrome136")
+    chrome_match = re.search(r"Chrome/(\d+)", CHROME_UA)
+    chrome_major = chrome_match.group(1) if chrome_match else "136"
+    http.headers.update({
+        "User-Agent": CHROME_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": f'"Not)A;Brand";v="8", "Chromium";v="{chrome_major}", "Google Chrome";v="{chrome_major}"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    })
     try:
         http.trust_env = False
     except Exception:

@@ -87,7 +87,7 @@ function syncFields(applyRailDefault=false){
   const promoSupported = plan === 'plus';
   $('promoLine').style.display = promoSupported ? 'flex' : 'none';
   $('plusPromoFields').hidden = !promoSupported || !$('usePromo').checked;
-  const needsExit = rail !== 'hosted' && rail !== 'pix';
+  const needsExit = rail === 'paypal';
   $('proxyGrid').classList.toggle('single', !needsExit);
   $('exitProxyField').hidden = !needsExit;
   $('exitProxy').required = needsExit;
@@ -95,11 +95,11 @@ function syncFields(applyRailDefault=false){
   const recommendations = {
     hosted: '推荐代理：使用账号常用地区。',
     paypal: '\u63a8\u8350\u4ee3\u7406\uff1a\u7cfb\u7edf\u4f18\u5148\u4f7f\u7528\u4ee3\u7406\u6c60 2 \u5f53\u524d\u56fd\u5bb6\u7684 PayPal \u8d26\u5355\uff1b\u82e5\u8be5\u56fd\u5bb6 Checkout \u672a\u5f00\u653e PayPal\uff0c\u5219\u81ea\u52a8\u56de\u9000\u5fb7\u56fd DE/EUR \u8d26\u5355\u3002',
-    ideal: '动态 rotate 会自动写入 country-nl；固定代理需要 NL 出口。',
-    upi: '动态 rotate 会自动写入 country-in；固定代理需要 IN 出口。',
-    pix: '推荐代理：代理池 1 使用 BR。'
+    ideal: '单代理池全程复用；动态 rotate 自动写入 country-nl，固定代理需要 NL 出口。',
+    upi: '单代理池全程复用；动态 rotate 自动写入 country-in，固定代理需要 IN 出口。',
+    pix: '单代理池全程复用；动态 rotate 自动写入 country-br，固定代理需要 BR 出口。'
   };
-  const pool2Hints = {paypal:'巴西 PayPal 推荐 BR',ideal:'推荐 NL',upi:'推荐 IN'};
+  const pool2Hints = {paypal:'巴西 PayPal 推荐 BR'};
   const recommendation = `${recommendations[rail] || '推荐代理：使用与所选地区一致的代理。'} 动态网关可用 __rotate__，国家参数由支付方式自动填写。`;
   $('proxyRecommendation').textContent = recommendation;
   $('proxyFootHint').textContent = recommendation;
@@ -189,6 +189,37 @@ function renderLogs(logs){
   else box.scrollTop = previousTop;
 }
 function escapeHtml(v){ return String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+function formatLeaseRemaining(seconds){
+  const value = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(value / 3600);
+  const minutes = Math.floor((value % 3600) / 60);
+  return hours ? `${hours} 小时 ${minutes} 分` : `${minutes} 分钟`;
+}
+function formatLeaseTime(timestamp){
+  if (!timestamp) return '—';
+  return new Date(Number(timestamp) * 1000).toLocaleString('zh-CN', {hour12:false});
+}
+async function refreshProxyLeases(){
+  const body = $('leaseTableBody');
+  try {
+    const response = await fetch('/api/proxy-leases', {cache:'no-store'});
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    const leases = payload.leases || [];
+    body.innerHTML = leases.length ? leases.map(row => `<tr>
+      <td><code>${escapeHtml(row.at_fingerprint)}</code></td>
+      <td>${escapeHtml(String(row.provider || '').toUpperCase())}</td>
+      <td>${escapeHtml(row.country || '—')}</td>
+      <td><code>${escapeHtml(row.exit_ip || '—')}</code></td>
+      <td><code>${escapeHtml(row.session_id || '—')}</code></td>
+      <td>${escapeHtml(formatLeaseRemaining(row.remaining_seconds))}</td>
+      <td><span class="lease-status">${escapeHtml(row.status === 'active' ? '活动' : row.status)}</span></td>
+      <td>${escapeHtml(formatLeaseTime(row.last_used_at))}</td>
+    </tr>`).join('') : '<tr><td colspan="8" class="lease-empty">暂无活动租约</td></tr>';
+  } catch (error) {
+    body.innerHTML = '<tr><td colspan="8" class="lease-empty">租约记录暂时不可用</td></tr>';
+  }
+}
 function setRunning(running){ $('submitButton').disabled = running; $('cancelButton').hidden = !running; }
 $('logBox').addEventListener('scroll', () => {
   const box = $('logBox');
@@ -227,8 +258,8 @@ async function poll(){
     const data = await r.json(); if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
     setProgress(data.percent, data.text, data.status);
     renderLogs(data.logs);
-    if (data.status === 'done') { clearInterval(pollTimer); setRunning(false); showResult(data.result || {}); }
-    if (data.status === 'error' || data.status === 'cancelled') { clearInterval(pollTimer); setRunning(false); if(data.error) renderLogs([...(data.logs||[]),{time:'ERROR',message:data.error}]); }
+    if (data.status === 'done') { clearInterval(pollTimer); setRunning(false); showResult(data.result || {}); refreshProxyLeases(); }
+    if (data.status === 'error' || data.status === 'cancelled') { clearInterval(pollTimer); setRunning(false); refreshProxyLeases(); if(data.error) renderLogs([...(data.logs||[]),{time:'ERROR',message:data.error}]); }
   }catch(e){ clearInterval(pollTimer); setRunning(false); setProgress(100, e.message || String(e), 'error'); }
 }
 
@@ -282,7 +313,10 @@ const requestedTheme = new URLSearchParams(location.search).get('theme');
 const saved=localStorage.getItem('pay153-theme');
 applyTheme(requestedTheme ? requestedTheme === 'dark' : (saved ? saved==='dark' : matchMedia('(prefers-color-scheme: dark)').matches));
 $('themeToggle').addEventListener('click',()=>applyTheme(!document.documentElement.classList.contains('dark')));
+$('refreshLeases').addEventListener('click', refreshProxyLeases);
 syncFields(true);
 restoreProxyPools();
 updateProxyCount($('entryProxy'), $('entryProxyCount'));
 updateProxyCount($('exitProxy'), $('exitProxyCount'));
+refreshProxyLeases();
+setInterval(refreshProxyLeases, 60000);

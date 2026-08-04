@@ -22,12 +22,13 @@ from curl_cffi import requests
 
 import stripe_checkout as sc
 from provider_checkout import PROVIDER_DEFAULTS, default_billing, stripe_to_provider
-from proxy_pool import OPTIMIZER, PROVIDER_PROXY_COUNTRIES, ProxyProbe
+from proxy_pool import OPTIMIZER, PROVIDER_PROXY_COUNTRIES, ProxyLeaseRegistry, ProxyProbe
 from sentinel_token import SentinelTokenProvider as BaseSentinel
 
 
 ROOT = Path(__file__).resolve().parent
 BACKEND_LOG_DIR = Path(os.getenv("PAY153_LOG_DIR", str(ROOT / "logs")))
+LEASES = ProxyLeaseRegistry(os.getenv("PAY153_PROXY_LEASE_FILE", str(ROOT / "data" / "proxy_leases.json")))
 LEGACY_SERVICE_BASE = str(os.getenv("PAY153_LEGACY_BASE", "")).rstrip("/")
 app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
 app.config["JSON_AS_ASCII"] = False
@@ -956,7 +957,7 @@ class JobStore:
             raise InterruptedError("任务已停止")
 
     def _run(self, job_id: str, options: dict):
-        account_lock = checkout_token_lock(str(options.get("token_raw") or ""))
+        account_lock = checkout_token_lock(str(options.get("token_lease_key") or options.get("access_token") or ""))
         if not account_lock.acquire(blocking=False):
             message = "同一账号已有提链任务正在运行；并发创建 Checkout 会让旧 Session 失效"
             self.log(job_id, f"错误：RuntimeError: {message}")
@@ -981,16 +982,54 @@ class JobStore:
             entry_pool = current["entry_proxies"]
             exit_pool = current.get("exit_proxies") or entry_pool
             provider = str(current.get("link_type") or "hosted")
-            target_proxy_country = PROVIDER_PROXY_COUNTRIES.get(provider, "")
+            single_chain = provider in {"hosted", "ideal", "upi", "pix"}
+            target_proxy_country = PROVIDER_PROXY_COUNTRIES.get(provider, "") or (
+                str(current.get("country") or "").upper() if provider == "hosted" else ""
+            )
             try:
-                entry_probe = OPTIMIZER.select(
-                    entry_pool,
-                    role="入口",
-                    provider=provider,
-                    expected_country=target_proxy_country,
-                    log=lambda message: self.log(job_id, message),
-                )
-                if provider == "pix":
+                lease = LEASES.get(current["token_lease_key"], provider, target_proxy_country) if single_chain else None
+                if lease:
+                    try:
+                        entry_probe = OPTIMIZER.probe(
+                            str(lease["proxy_url"]),
+                            expected_country=target_proxy_country,
+                            expires_at=float(lease.get("expires_at") or 0),
+                            force=attempt == 1,
+                        )
+                    except Exception as exc:
+                        LEASES.invalidate(current["token_lease_key"], str(exc))
+                        lease = None
+                    if lease:
+                        same_ip = not lease.get("exit_ip") or entry_probe.exit_ip == lease.get("exit_ip")
+                        if not entry_probe.ok or (target_proxy_country and entry_probe.country != target_proxy_country) or not same_ip:
+                            LEASES.invalidate(current["token_lease_key"], entry_probe.error or "proxy_ip_drift")
+                            lease = None
+                    if lease:
+                        LEASES.touch(current["token_lease_key"], entry_probe)
+                        self.log(
+                            job_id,
+                            f"AT 粘性租约复用：{provider.upper()} / {entry_probe.country} / "
+                            f"{entry_probe.exit_ip}，剩余 {max(0, int((entry_probe.expires_at - time.time()) / 60))} 分钟",
+                        )
+                if not lease:
+                    entry_probe = OPTIMIZER.select(
+                        entry_pool,
+                        role="入口",
+                        provider=provider,
+                        expected_country=target_proxy_country,
+                        log=lambda message: self.log(job_id, message),
+                    )
+                    if single_chain:
+                        lease = LEASES.put(
+                            current["token_lease_key"], provider, target_proxy_country, entry_probe,
+                        )
+                        self.log(
+                            job_id,
+                            f"AT 粘性租约已建立：{provider.upper()} / {entry_probe.country} / "
+                            f"{entry_probe.exit_ip}，有效期 "
+                            f"{max(1, int((float(lease['expires_at']) - time.time()) / 60))} 分钟",
+                        )
+                if single_chain:
                     exit_probe = entry_probe
                 else:
                     exit_probe = OPTIMIZER.select(
@@ -1066,6 +1105,8 @@ class JobStore:
             if state.get("status") in {"done", "cancelled"}:
                 if state.get("status") == "done":
                     OPTIMIZER.report(pair, success=True)
+                    if single_chain:
+                        LEASES.touch(current["token_lease_key"], entry_probe)
                 if state.get("status") == "done" and isinstance(state.get("result"), dict):
                     result = state["result"]
                     result["attempt"] = attempt
@@ -1081,6 +1122,15 @@ class JobStore:
             ))
             if not non_retryable:
                 OPTIMIZER.report(pair, success=False, error=last_error)
+            if non_retryable and single_chain:
+                LEASES.invalidate(current["token_lease_key"], last_error)
+            network_failure = any(marker in lowered for marker in (
+                "timeout", "timed out", "proxy", "connection", "network", "curl", "tls", "ssl",
+                "cloudflare", "chatgpt_403", "service unavailable", "bad gateway",
+            ))
+            if network_failure and single_chain:
+                LEASES.invalidate(current["token_lease_key"], last_error)
+                self.log(job_id, "当前 AT 的粘性代理网络异常，下一轮将生成新的动态 Session")
             if non_retryable or attempt >= max_attempts:
                 self.update(job_id, status="error", percent=100, text="任务失败", error=last_error[:1200])
                 return
@@ -1103,19 +1153,21 @@ class JobStore:
         network: AttemptNetworkContext | None = None
         try:
             self.update(job_id, status="running", percent=6, text="解析 Access Token")
-            token, meta = extract_access_token(options.pop("token_raw"))
+            token = str(options["access_token"])
+            meta = dict(options.get("token_meta") or {})
             self.ensure_not_cancelled(job_id)
             provider = options["link_type"]
             country = options["country"]
             entry_pool = options["entry_proxies"]
-            exit_pool = entry_pool if provider == "pix" else (options.get("exit_proxies") or entry_pool)
+            single_chain = provider in {"hosted", "ideal", "upi", "pix"}
+            exit_pool = entry_pool if single_chain else (options.get("exit_proxies") or entry_pool)
             entry_proxy = options.get("fixed_entry_proxy") or secrets.choice(entry_pool)
-            exit_proxy = entry_proxy if provider == "pix" else (options.get("fixed_exit_proxy") or secrets.choice(exit_pool))
+            exit_proxy = entry_proxy if single_chain else (options.get("fixed_exit_proxy") or secrets.choice(exit_pool))
             payment_geo: dict[str, str] = {}
             if provider == "hosted":
                 self.log(job_id, f"代理池共 {len(entry_pool)} 条，本次已自动选择 1 条")
-            elif provider == "pix":
-                self.log(job_id, f"代理池 1 共 {len(entry_pool)} 条，本次已自动选择 1 条")
+            elif single_chain:
+                self.log(job_id, f"代理池 1 共 {len(entry_pool)} 条，本次全流程固定使用 1 条真实 Session")
             else:
                 self.log(job_id, f"代理池 1 共 {len(entry_pool)} 条，代理池 2 共 {len(exit_pool)} 条，本次已分别自动选择")
             # Every outer retry creates a brand-new Checkout, so it must also
@@ -1177,10 +1229,10 @@ class JobStore:
                     self.log(job_id, f"PayPal 优惠识别代理当前为 {main_country or '?'}；不限制国家，继续尝试")
                 self.ensure_not_cancelled(job_id)
             if provider == "upi":
-                self.update(job_id, percent=9, text="第 1/7 步：校验 UPI 优惠识别代理与印度支付代理")
+                self.update(job_id, percent=9, text="第 1/7 步：校验 UPI 印度粘性代理")
                 main_country, main_region = proxy_country(entry_proxy)
                 payment_country, payment_region = proxy_country(exit_proxy)
-                self.log(job_id, f"UPI 代理校验：优惠识别={main_country}/{main_region}，UPI 支付={payment_country}/{payment_region}，账单=IN/INR")
+                self.log(job_id, f"UPI 代理校验：全流程={main_country}/{main_region}，真实 Session 固定，账单=IN/INR")
                 if promo_requested and main_country not in {"TR", "JP"}:
                     self.log(job_id, f"UPI 优惠识别代理当前为 {main_country or '?'}；不限制国家，继续尝试")
                 if payment_country != "IN":
@@ -1192,8 +1244,7 @@ class JobStore:
                 payment_country, payment_region = proxy_country(exit_proxy)
                 self.log(
                     job_id,
-                    f"iDEAL 代理校验：入口={main_country}/{main_region}，"
-                    f"支付={payment_country}/{payment_region}，账单=NL/EUR",
+                    f"iDEAL 代理校验：全流程={main_country}/{main_region}，真实 Session 固定，账单=NL/EUR",
                 )
                 if payment_country != "NL":
                     raise RuntimeError(
@@ -1241,9 +1292,9 @@ class JobStore:
             elif provider == "paypal" and promo_requested:
                 self.log(job_id, f"PayPal 设置：代理池 1 用于优惠检查，代理池 2 创建 {country}/{options['currency']} Checkout")
             elif provider == "upi":
-                self.log(job_id, "UPI 设置：代理池 1 用于优惠检查，代理池 2 创建 IN/INR Checkout")
+                self.log(job_id, "UPI 设置：优惠检查、IN/INR Checkout 与 Stripe 全部使用同一真实 Session")
             elif provider == "ideal":
-                self.log(job_id, "iDEAL 设置：代理池 2 创建 NL/EUR Checkout，并贯穿 Stripe 支付处理")
+                self.log(job_id, "iDEAL 设置：NL/EUR Checkout、优惠更新与 Stripe 全部使用同一真实 Session")
             elif provider != "hosted":
                 self.log(job_id, f"Checkout 将使用所选的 {country} 地区代理")
             created = create_checkout(
@@ -1275,9 +1326,9 @@ class JobStore:
                 if provider == "paypal":
                     self.log(job_id, f"PayPal 支付处理使用代理池 2（{country}）")
                 elif provider == "upi":
-                    self.log(job_id, "UPI 支付处理使用代理池 2（IN）")
+                    self.log(job_id, "UPI 支付处理继续复用同一 IN Session")
                 else:
-                    self.log(job_id, "iDEAL 优惠更新使用代理池 1，NL/EUR Checkout 与 Stripe 使用代理池 2")
+                    self.log(job_id, "iDEAL 优惠更新与 Stripe 继续复用同一 NL Session")
             session_id = checkout_data.get("checkout_session_id") or ""
             if not session_id and provider != "hosted":
                 raise RuntimeError("Checkout 未返回 Stripe Session ID")
@@ -1296,8 +1347,8 @@ class JobStore:
                 "checkout_country": options.get("checkout_country") or country,
                 "checkout_currency": options.get("checkout_currency") or options["currency"],
                 "entry_proxy_pool_size": int(options.get("entry_proxy_pool_size") or len(entry_pool)),
-                "exit_proxy_pool_size": int(options.get("exit_proxy_pool_size") or len(exit_pool)) if provider not in {"hosted", "pix"} else 0,
-                "proxy_mode": "single_chain" if provider == "pix" else ("entry_only" if provider == "hosted" else "dual_chain"),
+                "exit_proxy_pool_size": int(options.get("exit_proxy_pool_size") or len(exit_pool)) if provider == "paypal" else 0,
+                "proxy_mode": "dual_chain" if provider == "paypal" else "single_chain",
                 "entry_exit_ip": getattr(options.get("entry_proxy_probe"), "exit_ip", ""),
                 "entry_proxy_score": getattr(options.get("entry_proxy_probe"), "score", None),
                 "payment_exit_ip": getattr(options.get("exit_proxy_probe"), "exit_ip", ""),
@@ -1676,10 +1727,11 @@ def config():
         "provider_defaults": PROVIDER_DEFAULTS,
         "proxy_policy": {
             "entry_required": True,
-            "exit_required_for": ["paypal", "ideal", "upi"],
-            "single_chain_for": ["pix"],
+            "exit_required_for": ["paypal"],
+            "single_chain_for": ["hosted", "ideal", "upi", "pix"],
             "max_per_pool": 500,
             "selection": "deep_probe_sticky_session",
+            "lease_minutes": LEASES.lease_seconds // 60,
             "dynamic_country_routes": PROVIDER_PROXY_COUNTRIES,
         },
         "retry_policy": {"min": 1, "max": 50, "default_pix": 10, "default_other": 3},
@@ -1691,6 +1743,11 @@ def config():
             "workers": STORE.worker_limit,
         },
     })
+
+
+@app.get("/api/proxy-leases")
+def proxy_leases():
+    return jsonify({"ok": True, "leases": LEASES.public_records()})
 
 
 @app.post("/api/checkout")
@@ -1705,6 +1762,9 @@ def start_checkout():
     defaults = PROVIDER_DEFAULTS.get(link_type, {})
     country = str(data.get("country") or defaults.get("country") or "US").upper()
     requested_currency = str(data.get("currency") or defaults.get("currency") or COUNTRY_CURRENCY.get(country, "USD")).upper()
+    if link_type in {"ideal", "upi", "pix"}:
+        country = str(defaults.get("country") or country).upper()
+        requested_currency = str(defaults.get("currency") or COUNTRY_CURRENCY.get(country, "USD")).upper()
     currency, _currency_source = normalize_checkout_currency(country, requested_currency)
     entry_raw = data.get("entry_proxies")
     if entry_raw is None:
@@ -1714,16 +1774,16 @@ def start_checkout():
         exit_raw = data.get("exit_proxy") or data.get("payment_proxy") or ""
     if not entry_raw:
         return jsonify({"error": "请填写 Checkout 入口代理"}), 400
-    if link_type not in {"hosted", "pix"} and not exit_raw:
+    if link_type == "paypal" and not exit_raw:
         return jsonify({"error": "当前支付路径需要填写支付出口代理"}), 400
     try:
         entry_proxies = normalize_proxy_pool(entry_raw, "入口代理")
-        exit_proxies = normalize_proxy_pool(exit_raw, "出口代理") if exit_raw and link_type != "pix" else []
+        exit_proxies = normalize_proxy_pool(exit_raw, "出口代理") if exit_raw and link_type == "paypal" else []
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     if not entry_proxies:
         return jsonify({"error": "入口代理至少填写 1 条"}), 400
-    if link_type not in {"hosted", "pix"} and not exit_proxies:
+    if link_type == "paypal" and not exit_proxies:
         return jsonify({"error": "出口代理至少填写 1 条"}), 400
     raw_pix_tax_id = re.sub(r"\D", "", str(data.get("pix_tax_id") or ""))[:14] if link_type == "pix" else ""
     try:
@@ -1747,8 +1807,15 @@ def start_checkout():
                 if not manual_identity["name"]:
                     return jsonify({"error": f"CNPJ 登记信息查询失败：{exc}"}), 400
         pix_identity.update({key: value for key, value in manual_identity.items() if value})
+    token_raw = str(data.get("token") or "")
+    try:
+        access_token, token_meta = extract_access_token(token_raw)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return jsonify({"error": str(exc)}), 400
     options = {
-        "token_raw": str(data.get("token") or ""),
+        "access_token": access_token,
+        "token_meta": token_meta,
+        "token_lease_key": LEASES.token_hash(access_token),
         "plan": plan,
         "link_type": link_type,
         "country": country,
@@ -1756,7 +1823,7 @@ def start_checkout():
         "checkout_country": country,
         "checkout_currency": currency,
         "entry_proxies": entry_proxies,
-        "exit_proxies": entry_proxies if link_type == "pix" else exit_proxies,
+        "exit_proxies": exit_proxies if link_type == "paypal" else entry_proxies,
         "use_promo": bool(data.get("use_promo", True)) if plan == "plus" else False,
         "promo_campaign": str(data.get("promo_campaign") or "") if plan == "plus" else "",
         "promo_code": str(data.get("promo_code") or "") if plan == "team" else "",
@@ -1773,8 +1840,6 @@ def start_checkout():
         "pix_identity": pix_identity,
         "retry_count": retry_count,
     }
-    if not options["token_raw"].strip():
-        return jsonify({"error": "请填写 Access Token 或 Session JSON"}), 400
     if link_type == "pix" and options["pix_tax_id"] and len(options["pix_tax_id"]) not in {11, 14}:
         return jsonify({"error": "PIX 需要填写 11 位 CPF 或 14 位 CNPJ"}), 400
     client_ip = request_client_ip()

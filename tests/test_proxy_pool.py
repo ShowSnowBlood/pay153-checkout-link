@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
+import json
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.parse import unquote, urlsplit
 
 import proxy_pool
-from proxy_pool import ProxyPoolOptimizer, ProxyProbe
+from proxy_pool import ProxyLeaseRegistry, ProxyPoolOptimizer, ProxyProbe
 
 
 def probe(proxy_url: str, *, ip: str, country: str, score: float, ok: bool = True) -> ProxyProbe:
@@ -164,6 +168,140 @@ class AttemptNetworkContextTests(unittest.TestCase):
         self.assertEqual(build.call_count, 2)
         first.close.assert_called_once_with()
         second.close.assert_called_once_with()
+
+    def test_single_chain_builds_only_one_http_session(self) -> None:
+        from app import AttemptNetworkContext
+
+        session = Mock()
+        session.cookies = Mock()
+        proxy_url = "http://sticky.test:8000"
+        with patch("app.sc.build_http", return_value=session) as build:
+            context = AttemptNetworkContext(proxy_url, proxy_url, "device", "did")
+            self.assertIs(context.http(context.entry_proxy), context.http(context.exit_proxy))
+            context.close()
+
+        build.assert_called_once_with(proxy_url)
+        session.close.assert_called_once_with()
+
+
+class ProxyLeaseRegistryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.path = Path(self.tempdir.name) / "proxy_leases.json"
+        self.registry = ProxyLeaseRegistry(self.path, lease_minutes=120)
+        self.token = "eyJ.test.access-token-plaintext"
+        self.token_hash = self.registry.token_hash(self.token)
+        self.proxy = "http://account-country-in-session-session123456-lifetime-120:secret@gateway.test:6060"
+        self.probe = probe(self.proxy, ip="1.1.1.1", country="IN", score=95)
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_persists_and_reloads_without_plaintext_access_token(self) -> None:
+        self.registry.put(self.token_hash, "upi", "IN", self.probe)
+        persisted = self.path.read_text(encoding="utf-8")
+        self.assertNotIn(self.token, persisted)
+        self.assertIn(self.token_hash, persisted)
+
+        reloaded = ProxyLeaseRegistry(self.path, lease_minutes=120)
+        row = reloaded.get(self.token_hash, "upi", "IN")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["exit_ip"], "1.1.1.1")
+        self.assertEqual(row["session_id"], "session123456")
+
+    def test_provider_or_country_change_replaces_the_only_active_lease(self) -> None:
+        self.registry.put(self.token_hash, "upi", "IN", self.probe)
+        self.assertIsNone(self.registry.get(self.token_hash, "ideal", "NL"))
+        self.assertEqual(self.registry.public_records(), [])
+
+        nl_probe = probe(self.proxy.replace("country-in", "country-nl"), ip="8.8.8.8", country="NL", score=90)
+        self.registry.put(self.token_hash, "ideal", "NL", nl_probe)
+        records = self.registry.public_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["provider"], "ideal")
+
+    def test_expired_lease_is_purged(self) -> None:
+        expired = ProxyProbe(**{**self.probe.__dict__, "expires_at": time.time() - 1})
+        self.registry.put(self.token_hash, "upi", "IN", expired)
+        self.assertEqual(self.registry.public_records(), [])
+        self.assertIsNone(self.registry.get(self.token_hash, "upi", "IN"))
+
+    def test_public_record_is_sanitized(self) -> None:
+        self.registry.put(self.token_hash, "upi", "IN", self.probe)
+        record = self.registry.public_records()[0]
+        serialized = json.dumps(record)
+        self.assertNotIn("proxy_url", record)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn(self.token_hash, serialized)
+        self.assertEqual(record["session_id"], "sess...3456")
+
+    def test_invalidate_removes_lease(self) -> None:
+        self.registry.put(self.token_hash, "upi", "IN", self.probe)
+        self.assertTrue(self.registry.invalidate(self.token_hash, "timeout"))
+        self.assertEqual(self.registry.public_records(), [])
+
+
+class ProxyLeaseApiTests(unittest.TestCase):
+    @staticmethod
+    def jwt() -> str:
+        def encode(value: dict) -> str:
+            return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+        return f"{encode({'alg': 'none'})}.{encode({'exp': int(time.time()) + 3600})}.signature"
+
+    def test_config_only_requires_second_pool_for_paypal(self) -> None:
+        import app as checkout_app
+
+        response = checkout_app.app.test_client().get("/api/config")
+        policy = response.get_json()["proxy_policy"]
+        self.assertEqual(policy["exit_required_for"], ["paypal"])
+        self.assertIn("upi", policy["single_chain_for"])
+        self.assertIn("ideal", policy["single_chain_for"])
+
+    def test_upi_request_uses_entry_pool_for_both_sides(self) -> None:
+        import app as checkout_app
+
+        captured: dict = {}
+
+        def create(options: dict) -> str:
+            captured.update(options)
+            return "job123"
+
+        payload = {
+            "token": self.jwt(),
+            "plan": "plus",
+            "link_type": "upi",
+            "country": "US",
+            "currency": "USD",
+            "entry_proxies": ["http://user:secret@gateway.test:6060"],
+        }
+        with patch.object(checkout_app.STORE, "create", side_effect=create), \
+             patch.object(checkout_app.STORE, "queue_position", return_value=0), \
+             patch.object(checkout_app.IP_TASK_LIMITER, "acquire", return_value=(True, 0)):
+            response = checkout_app.app.test_client().post("/api/checkout", json=payload)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(captured["entry_proxies"], captured["exit_proxies"])
+        self.assertEqual((captured["country"], captured["currency"]), ("IN", "INR"))
+        self.assertNotIn("token_raw", captured)
+        self.assertEqual(len(captured["token_lease_key"]), 64)
+
+    def test_proxy_lease_api_never_returns_proxy_credentials(self) -> None:
+        import app as checkout_app
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ProxyLeaseRegistry(Path(directory) / "leases.json", lease_minutes=120)
+            token_hash = registry.token_hash(self.jwt())
+            credentialed = "http://user-session-abcdef123456-lifetime-120:secret@gateway.test:6060"
+            registry.put(token_hash, "ideal", "NL", probe(credentialed, ip="8.8.8.8", country="NL", score=96))
+            with patch.object(checkout_app, "LEASES", registry):
+                response = checkout_app.app.test_client().get("/api/proxy-leases")
+
+        body = response.get_json()
+        serialized = json.dumps(body)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("proxy_url", serialized)
+        self.assertNotIn(token_hash, serialized)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
+import json
 import os
 import random
 import re
@@ -9,6 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
@@ -19,6 +22,7 @@ _SESSION_MARKERS = ("__rotate__", "{session}", "%7bsession%7d")
 _SESSION_WORD_RE = re.compile(r"(?i)(-session-)rotate(?=-)")
 _LIFETIME_RE = re.compile(r"(?i)(?:^|-)lifetime-(\d+)(?:-|$)")
 _COUNTRY_RE = re.compile(r"(?i)(-country-)([a-z]{2})(?=-|$)")
+_CONCRETE_SESSION_RE = re.compile(r"(?i)(?:^|-)session-([a-z0-9_]+)(?=-|$)")
 
 PROVIDER_PROXY_COUNTRIES = {
     "kakao": "KR",
@@ -147,6 +151,153 @@ def materialize_proxy_url(proxy_url: str, *, country: str = "") -> tuple[str, fl
         lifetime = max(1, int(match.group(1))) * 60
     expires_at = time.time() + lifetime if lifetime else 0.0
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)), expires_at
+
+
+def proxy_session_id(proxy_url: str) -> str:
+    try:
+        username = unquote(urlsplit(str(proxy_url or "")).username or "")
+    except Exception:
+        return ""
+    match = _CONCRETE_SESSION_RE.search(username)
+    return str(match.group(1) if match else "")
+
+
+class ProxyLeaseRegistry:
+    """Persist one concrete sticky proxy session per Access Token hash."""
+
+    def __init__(self, path: str | os.PathLike[str] | None = None, lease_minutes: int | None = None) -> None:
+        self.path = Path(path or os.getenv("PAY153_PROXY_LEASE_FILE", "data/proxy_leases.json"))
+        configured = lease_minutes if lease_minutes is not None else int(os.getenv("PAY153_PROXY_LEASE_MINUTES", "120"))
+        self.lease_seconds = max(1, configured) * 60
+        self._lock = threading.RLock()
+        self._leases: dict[str, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            rows = payload.get("leases", {}) if isinstance(payload, dict) else {}
+            if isinstance(rows, dict):
+                self._leases = {
+                    str(key): dict(value) for key, value in rows.items()
+                    if isinstance(value, dict) and value.get("proxy_url")
+                }
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            self._leases = {}
+        self._purge_expired(save=False)
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps({"version": 1, "leases": self._leases}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        temporary.replace(self.path)
+        try:
+            self.path.chmod(0o600)
+        except OSError:
+            pass
+
+    def _purge_expired(self, *, save: bool = True) -> bool:
+        now = time.time()
+        expired = [key for key, row in self._leases.items() if float(row.get("expires_at") or 0) <= now + 15]
+        for key in expired:
+            self._leases.pop(key, None)
+        if expired and save:
+            self._save()
+        return bool(expired)
+
+    @staticmethod
+    def token_hash(access_token: str) -> str:
+        return hashlib.sha256(str(access_token or "").strip().encode("utf-8")).hexdigest()
+
+    def get(self, token_hash: str, provider: str, country: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._purge_expired()
+            row = self._leases.get(str(token_hash))
+            if not row:
+                return None
+            if row.get("provider") != str(provider) or row.get("country") != str(country).upper():
+                self._leases.pop(str(token_hash), None)
+                self._save()
+                return None
+            return dict(row)
+
+    def put(self, token_hash: str, provider: str, country: str, probe: ProxyProbe) -> dict[str, Any]:
+        now = time.time()
+        expires_at = float(probe.expires_at or (now + self.lease_seconds))
+        expires_at = min(expires_at, now + self.lease_seconds)
+        row = {
+            "token_hash": str(token_hash),
+            "provider": str(provider),
+            "country": str(country).upper(),
+            "proxy_url": probe.proxy_url,
+            "session_id": proxy_session_id(probe.proxy_url),
+            "exit_ip": probe.exit_ip,
+            "score": probe.score,
+            "latency_ms": probe.latency_ms,
+            "created_at": now,
+            "last_used_at": now,
+            "expires_at": expires_at,
+            "status": "active",
+            "error": "",
+        }
+        with self._lock:
+            self._leases[str(token_hash)] = row
+            self._save()
+        return dict(row)
+
+    def touch(self, token_hash: str, probe: ProxyProbe | None = None) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._leases.get(str(token_hash))
+            if not row:
+                return None
+            row["last_used_at"] = time.time()
+            row["status"] = "active"
+            row["error"] = ""
+            if probe is not None:
+                row["exit_ip"] = probe.exit_ip
+                row["score"] = probe.score
+                row["latency_ms"] = probe.latency_ms
+            self._save()
+            return dict(row)
+
+    def invalidate(self, token_hash: str, error: str = "") -> bool:
+        with self._lock:
+            removed = self._leases.pop(str(token_hash), None)
+            if removed:
+                self._save()
+            return bool(removed)
+
+    def public_records(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._purge_expired()
+            now = time.time()
+            rows = []
+            for row in self._leases.values():
+                session_id = str(row.get("session_id") or "")
+                rows.append({
+                    "at_fingerprint": str(row.get("token_hash") or "")[:12],
+                    "provider": row.get("provider") or "",
+                    "country": row.get("country") or "",
+                    "exit_ip": row.get("exit_ip") or "",
+                    "session_id": (
+                        f"{session_id[:4]}...{session_id[-4:]}" if len(session_id) > 10 else session_id
+                    ),
+                    "score": row.get("score"),
+                    "latency_ms": row.get("latency_ms"),
+                    "created_at": row.get("created_at"),
+                    "last_used_at": row.get("last_used_at"),
+                    "expires_at": row.get("expires_at"),
+                    "remaining_seconds": max(0, int(float(row.get("expires_at") or 0) - now)),
+                    "status": row.get("status") or "active",
+                })
+            return sorted(rows, key=lambda item: float(item.get("last_used_at") or 0), reverse=True)
 
 
 def _valid_public_ip(value: str) -> bool:
@@ -294,11 +445,13 @@ class ProxyPoolOptimizer:
         except Exception as exc:
             return False, f"stripe_{type(exc).__name__}"
 
-    def probe(self, proxy_url: str, *, expected_country: str = "", expires_at: float = 0.0) -> ProxyProbe:
+    def probe(
+        self, proxy_url: str, *, expected_country: str = "", expires_at: float = 0.0, force: bool = False,
+    ) -> ProxyProbe:
         now = time.time()
         with self._lock:
             cached = self._cache.get(proxy_url)
-            if cached and now - cached[0] <= self.cache_ttl:
+            if not force and cached and now - cached[0] <= self.cache_ttl:
                 probe = cached[1]
                 if not probe.expires_at or probe.expires_at > now + 15:
                     return probe

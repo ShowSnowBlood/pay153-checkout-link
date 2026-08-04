@@ -373,5 +373,54 @@ class ProxyLeaseApiTests(unittest.TestCase):
         self.assertNotIn(token_hash, serialized)
 
 
+class ProviderBillingOrderTests(unittest.TestCase):
+    def test_upi_india_billing_is_synced_before_promo_update(self) -> None:
+        import provider_checkout
+
+        events: list[str] = []
+        billing = {
+            "name": "Arjun Sharma",
+            "email": "test@example.com",
+            "address": {
+                "country": "IN", "line1": "1 MG Road", "city": "Bengaluru",
+                "postal_code": "560001", "state": "KA",
+            },
+        }
+        ctx = {
+            "checkout_amount": 169407,
+            "payment_method_types": ["card", "upi"],
+            "return_url": "https://chatgpt.com/checkout/openai_llc/session",
+        }
+
+        def update_tax(*args, **kwargs):
+            events.append("tax_region")
+            args[4]["checkout_amount"] = 199900
+            self.assertEqual(args[5]["address"]["country"], "IN")
+            return {}
+
+        def snapshot(*args, **kwargs):
+            events.append("snapshot")
+            self.assertEqual(args[4]["address"]["postal_code"], "560001")
+
+        def apply_promo(_processor: str):
+            events.append("promo")
+            raise RuntimeError("stop-after-order-check")
+
+        with patch.object(provider_checkout.sc, "verify_pk", return_value="pk_test"), \
+             patch.object(provider_checkout.sc, "init_checkout", return_value=({}, "version", ctx)), \
+             patch.object(provider_checkout.sc, "fetch_elements_session", return_value={}), \
+             patch.object(provider_checkout.sc, "update_tax_region", side_effect=update_tax), \
+             patch.object(provider_checkout.sc, "snapshot_billing", side_effect=snapshot):
+            with self.assertRaisesRegex(RuntimeError, "stop-after-order-check"):
+                provider_checkout.stripe_to_provider(
+                    Mock(), "cs_test", "upi", billing=billing, country="IN",
+                    chatgpt_http=Mock(), access_token="token", stage1={},
+                    apply_promo_callback=apply_promo, require_zero_due=True,
+                    local_method_strategy="standalone",
+                )
+
+        self.assertEqual(events, ["tax_region", "snapshot", "promo"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1065,6 +1065,15 @@ def stripe_to_provider(
         raise RuntimeError(f"当前 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
     sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
     processor = str(stage1.get("processor_entity") or "") or sc._entity_from_return_url(ctx.get("return_url") or init_data.get("return_url") or "") or "openai_llc"
+
+    def sync_billing_context() -> None:
+        ctx["billing"] = billing
+        sc.update_tax_region(http, session_id, pk, version, ctx, billing, profile, log)
+        sc.snapshot_billing(chatgpt_http, access_token, session_id, processor, billing, log)
+
+    # The Checkout and ChatGPT snapshot must already carry the local billing
+    # address before promotion eligibility is recalculated.
+    sync_billing_context()
     if apply_promo_callback and not late_promo:
         original_checkout_amount = ctx.get("checkout_amount")
         try:
@@ -1083,6 +1092,7 @@ def stripe_to_provider(
             if provider not in methods:
                 raise RuntimeError(f"应用优惠后 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
             sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+            sync_billing_context()
     if provider == "pix" and require_zero_due and not late_promo:
         original_checkout_amount = ctx.get("original_checkout_amount")
         init_data, version, ctx = _hosted_checkout_init(
@@ -1094,8 +1104,7 @@ def stripe_to_provider(
             raise RuntimeError(
                 f"PIX hosted init 未开放 pix，可用方式：{', '.join(methods) or 'card'}"
             )
-    ctx["billing"] = billing
-    sc.update_tax_region(http, session_id, pk, version, ctx, billing, profile, log)
+        sync_billing_context()
     checkout_amount = ctx.get("checkout_amount")
     if ctx.get("original_checkout_amount") in (None, "", 0, "0"):
         ctx["original_checkout_amount"] = checkout_amount
@@ -1127,8 +1136,6 @@ def stripe_to_provider(
                 log("[promo] 第 5/7 步：返回 BR 主链路并校验通过，Stripe 今日应付 amount=0")
             else:
                 log("[promo] Plus 首月免费校验通过：Stripe 今日应付 amount=0")
-    sc.snapshot_billing(chatgpt_http, access_token, session_id, processor, billing, log)
-
     if provider == "pix":
         log("[pix] 第 6/7 步：创建独立 PIX PaymentMethod")
     elif provider == "upi":
@@ -1182,6 +1189,13 @@ def stripe_to_provider(
                 log(f"[{provider}] PaymentMethod 已挂载，开始延后应用优惠")
                 apply_promo_callback(processor)
                 promo_init, _promo_version, promo_ctx = sc.init_checkout(http, session_id, pk, profile, log)
+                promo_ctx["billing"] = billing
+                sc.update_tax_region(
+                    http, session_id, pk, _promo_version, promo_ctx, billing, profile, log,
+                )
+                sc.snapshot_billing(
+                    chatgpt_http, access_token, session_id, processor, billing, log,
+                )
                 promo_amount = promo_ctx.get("checkout_amount")
                 try:
                     promo_applied = int(str(promo_amount or 0)) == 0

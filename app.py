@@ -1605,15 +1605,25 @@ class JobStore:
             def approve_cb(processor: str):
                 self.ensure_not_cancelled(job_id)
                 advance_progress(90, "正在确认支付请求")
+                approval_proxy = checkout_proxy
+                approval_http = provider_chatgpt_http
+                if provider == "upi" and promo_requested and not single_chain:
+                    # ChatGPT approval is a merchant/backend eligibility action,
+                    # so keep it on the same JP entry Session that performed the
+                    # promo update. Stripe/UPI traffic remains on the IN payment
+                    # Session through `stripe_http` above.
+                    approval_proxy = entry_proxy
+                    approval_http = promo_chatgpt_http
+                    self.log(job_id, "UPI approval 改用优惠入口 JP Session")
                 self.log(job_id, "提交 Checkout approval")
                 approve_checkout(
                     token,
                     session_id,
                     processor,
-                    checkout_proxy,
+                    approval_proxy,
                     device_id,
                     did,
-                    http=provider_chatgpt_http,
+                    http=approval_http,
                     log=provider_log,
                 )
                 self.ensure_not_cancelled(job_id)

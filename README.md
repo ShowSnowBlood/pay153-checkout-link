@@ -119,7 +119,12 @@ host:port:username:password
 http://username:password@host:port
 https://username:password@host:port
 socks5://username:password@host:port
+socks5://host:port:username:password
+http://host:port:username:password
 ```
+
+`rp.scrapegw.com:6060` 使用 HTTP 协议。直接填写供应商的四段格式时，服务会自动补充
+`-session-__rotate__-lifetime-120`，并按 UPI/iDEAL/PIX 写入 IN/NL/BR 国家参数。
 
 动态网关可以把用户名中的 session 值写成 `__rotate__`：
 

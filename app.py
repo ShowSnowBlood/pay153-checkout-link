@@ -221,16 +221,36 @@ def normalize_proxy(raw: str) -> str:
         return username, password
 
     def build(scheme: str, host: str, port: int, username: str = "", password: str = "") -> str:
+        bare_host = host.strip("[]").lower()
+        if bare_host == "rp.scrapegw.com" and port == 6060:
+            # Scrapegw's residential endpoint speaks authenticated HTTP.
+            # Its session/lifetime username fields pin one real exit IP.
+            scheme = "http"
+            lowered_username = username.lower()
+            if username and "-session-" not in lowered_username:
+                username += "-session-__rotate__-lifetime-120"
+            elif username and "-lifetime-" not in lowered_username:
+                username += "-lifetime-120"
         auth = ""
         if username or password:
             auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
         return f"{scheme}://{auth}{host}:{port}"
 
     if "://" in value:
-        parsed = urlsplit(value)
-        scheme = parsed.scheme.lower()
+        scheme, remainder = value.split("://", 1)
+        scheme = scheme.lower()
         if scheme not in {"http", "https", "socks5", "socks5h"}:
             raise ValueError(f"代理协议 {scheme} 暂未支持")
+        # Some proxy vendors publish scheme://host:port:user:password.
+        # Normalize that transport notation into a standard authenticated URL.
+        parts = remainder.split(":")
+        if "@" not in remainder and len(parts) >= 4 and parts[1].isdigit():
+            host, port = host_port(f"{parts[0]}:{parts[1]}")
+            return build(scheme, host, port, parts[2], ":".join(parts[3:]))
+        if "@" not in remainder and len(parts) >= 4 and parts[-1].isdigit():
+            host, port = host_port(f"{parts[-2]}:{parts[-1]}")
+            return build(scheme, host, port, parts[0], ":".join(parts[1:-2]))
+        parsed = urlsplit(value)
         try:
             port = parsed.port
         except ValueError as exc:

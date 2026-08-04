@@ -70,6 +70,44 @@ class DynamicSessionTests(unittest.TestCase):
         self.assertEqual(proxy_pool.PROVIDER_PROXY_COUNTRIES["ideal"], "NL")
 
 
+class ProxyInputFormatTests(unittest.TestCase):
+    def test_scheme_host_port_username_password_format(self) -> None:
+        from app import normalize_proxy
+
+        raw = "socks5://rp.scrapegw.com:6060:sample-user:sample-password"
+        self.assertEqual(
+            normalize_proxy(raw),
+            "http://sample-user-session-__rotate__-lifetime-120:sample-password@rp.scrapegw.com:6060",
+        )
+
+    def test_http_vendor_format_preserves_colon_in_password(self) -> None:
+        from app import normalize_proxy
+
+        raw = "http://rp.scrapegw.com:6060:sample-user:password:part"
+        self.assertEqual(
+            normalize_proxy(raw),
+            "http://sample-user-session-__rotate__-lifetime-120:password%3Apart@rp.scrapegw.com:6060",
+        )
+
+    def test_standard_authenticated_url_still_works(self) -> None:
+        from app import normalize_proxy
+
+        raw = "socks5://sample-user:sample-password@proxy.example:6060"
+        self.assertEqual(normalize_proxy(raw), raw)
+
+    def test_scrapegw_template_receives_payment_country(self) -> None:
+        from app import normalize_proxy
+
+        normalized = normalize_proxy("http://rp.scrapegw.com:6060:sample-user:sample-password")
+        self.assertTrue(proxy_pool.is_dynamic_template(normalized))
+        routed = proxy_pool.set_rotating_gateway_country(normalized, "IN")
+        username = unquote(urlsplit(routed).username or "")
+        self.assertEqual(
+            username,
+            "sample-user-country-in-session-__rotate__-lifetime-120",
+        )
+
+
 class OptimizerSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.optimizer = ProxyPoolOptimizer()

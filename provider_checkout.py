@@ -1216,7 +1216,7 @@ def stripe_to_provider(
                 session_id,
                 log,
                 ctx=ctx,
-                max_attempts=3,
+                max_attempts=8,
             )
             out = extract_provider_result(confirm, provider)
             decline = payment_decline(confirm)

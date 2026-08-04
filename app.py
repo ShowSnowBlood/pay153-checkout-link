@@ -766,6 +766,14 @@ def approve_checkout(
         payload = {}
     result = str(payload.get("result") or "").lower()
     if result and result != "approved":
+        # Some local-method zero-due flows return HTTP 200 with
+        # {"result":"exception"} even though Stripe has already accepted the
+        # manual approval asynchronously. Do not discard the zero-amount
+        # Payment Page immediately; let the caller poll Stripe for the actual
+        # next_action/QR and fail only if no provider result appears.
+        if result == "exception":
+            log("[stripe] manual_approval approve returned exception; continuing Stripe poll")
+            return payload
         raise RuntimeError(f"manual_approval approve blocked: result={result}")
     return payload
 

@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.venv
+venv
+__pycache__
+*.py[cod]
+*.log
+*.jsonl
+*.zip
+data
+logs
+backups
+docs
+node_modules

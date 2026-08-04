@@ -1,0 +1,10 @@
+{
+  "name": "pay153-checkout-link",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Node runtime dependencies for Sentinel token generation",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "jsdom": "24.1.3"
+  }
+}

@@ -1,0 +1,20 @@
+services:
+  pay153:
+    build:
+      context: .
+    container_name: pay153-checkout-link
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PAY153_BILLING_ADDRESS_CACHE: /app/data/billing_addresses.json
+      PAY153_LOG_DIR: /app/logs
+      PAY153_WORKERS: ${PAY153_WORKERS:-20}
+      PAY153_GLOBAL_RPM: ${PAY153_GLOBAL_RPM:-20}
+      PAY153_IP_RPM: ${PAY153_IP_RPM:-3}
+    ports:
+      - "${PAY153_PORT:-18096}:18096"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs

@@ -24,6 +24,6 @@ USER pay153
 EXPOSE 18096
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18096/api/health', timeout=3)" || exit 1
+    CMD python -c "import os, urllib.request; assert os.access('/app/data', os.W_OK) and os.access('/app/logs', os.W_OK); urllib.request.urlopen('http://127.0.0.1:18096/api/health', timeout=3)" || exit 1
 
 CMD ["gunicorn", "--workers", "1", "--threads", "12", "--timeout", "600", "--bind", "0.0.0.0:18096", "app:app"]

@@ -89,6 +89,14 @@ gunicorn --workers 1 --threads 12 --timeout 600 \
   --bind 127.0.0.1:18096 app:app
 ```
 
+Docker 首次使用主机目录挂载时，需要让容器用户可以写入持久化目录：
+
+```bash
+mkdir -p data logs
+docker run --rm -v "$PWD/data:/data" -v "$PWD/logs:/logs" \
+  --entrypoint sh python:3.11-slim-bookworm -c 'chown -R 10001:10001 /data /logs'
+```
+
 ## 环境变量
 
 复制示例文件：

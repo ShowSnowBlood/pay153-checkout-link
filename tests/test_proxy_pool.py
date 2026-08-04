@@ -295,8 +295,9 @@ class ProxyLeaseApiTests(unittest.TestCase):
         self.assertFalse(policy["entry_required"])
         self.assertEqual(policy["exit_required_for"], [])
         self.assertTrue(policy["managed_gateway"])
-        self.assertIn("upi", policy["single_chain_for"])
+        self.assertIn("upi_without_promo", policy["single_chain_for"])
         self.assertIn("ideal", policy["single_chain_for"])
+        self.assertEqual(policy["dual_region_for"]["upi_promo"], {"entry": "JP", "payment": "IN"})
 
     def test_managed_gateway_creates_upi_request_without_client_proxy(self) -> None:
         import app as checkout_app
@@ -318,6 +319,7 @@ class ProxyLeaseApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(captured["entry_proxies"], captured["exit_proxies"])
         self.assertTrue(proxy_pool.is_dynamic_template(captured["entry_proxies"][0]))
+        self.assertEqual(captured["promo_proxy_country"], "JP")
 
     def test_frontend_has_no_proxy_pool_inputs(self) -> None:
         source = (Path(__file__).parents[1] / "static" / "index.html").read_text(encoding="utf-8")
@@ -353,6 +355,18 @@ class ProxyLeaseApiTests(unittest.TestCase):
         self.assertEqual((captured["country"], captured["currency"]), ("IN", "INR"))
         self.assertNotIn("token_raw", captured)
         self.assertEqual(len(captured["token_lease_key"]), 64)
+
+    def test_upi_promo_routes_japan_entry_and_india_payment(self) -> None:
+        import app as checkout_app
+
+        route = checkout_app.checkout_proxy_route({
+            "link_type": "upi",
+            "country": "IN",
+            "use_promo": True,
+            "promo_proxy_country": "JP",
+        })
+
+        self.assertEqual(route, ("JP", "IN", False))
 
     def test_proxy_lease_api_never_returns_proxy_credentials(self) -> None:
         import app as checkout_app

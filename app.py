@@ -657,6 +657,19 @@ def proxy_country(proxy: str) -> tuple[str, str]:
     return data["country"], data["region"]
 
 
+def checkout_proxy_route(options: dict) -> tuple[str, str, bool]:
+    """Return entry country, payment country, and whether both share one Session."""
+    provider = str(options.get("link_type") or "hosted").lower()
+    checkout_country = str(options.get("country") or "").upper()
+    if provider == "upi" and options.get("use_promo"):
+        promo_country = str(options.get("promo_proxy_country") or "JP").upper()
+        return promo_country, "IN", False
+    target_country = PROVIDER_PROXY_COUNTRIES.get(provider, "") or (
+        checkout_country if provider == "hosted" else ""
+    )
+    return target_country, target_country, provider in {"hosted", "ideal", "upi", "pix"}
+
+
 def update_checkout_promo(
     http,
     token: str,
@@ -1003,17 +1016,15 @@ class JobStore:
             entry_pool = current["entry_proxies"]
             exit_pool = current.get("exit_proxies") or entry_pool
             provider = str(current.get("link_type") or "hosted")
-            single_chain = provider in {"hosted", "ideal", "upi", "pix"}
-            target_proxy_country = PROVIDER_PROXY_COUNTRIES.get(provider, "") or (
-                str(current.get("country") or "").upper() if provider == "hosted" else ""
-            )
+            entry_target_country, exit_target_country, single_chain = checkout_proxy_route(current)
+            target_proxy_country = entry_target_country
             try:
                 lease = LEASES.get(current["token_lease_key"], provider, target_proxy_country) if single_chain else None
                 if lease:
                     try:
                         entry_probe = OPTIMIZER.probe(
                             str(lease["proxy_url"]),
-                            expected_country=target_proxy_country,
+                            expected_country=entry_target_country,
                             expires_at=float(lease.get("expires_at") or 0),
                             force=attempt == 1,
                         )
@@ -1037,7 +1048,7 @@ class JobStore:
                         entry_pool,
                         role="入口",
                         provider=provider,
-                        expected_country=target_proxy_country,
+                        expected_country=entry_target_country,
                         log=lambda message: self.log(job_id, message),
                     )
                     if single_chain:
@@ -1057,7 +1068,7 @@ class JobStore:
                         exit_pool,
                         role="支付",
                         provider=provider,
-                        expected_country=target_proxy_country,
+                        expected_country=exit_target_country,
                         log=lambda message: self.log(job_id, message),
                     )
             except Exception as exc:
@@ -1180,7 +1191,7 @@ class JobStore:
             provider = options["link_type"]
             country = options["country"]
             entry_pool = options["entry_proxies"]
-            single_chain = provider in {"hosted", "ideal", "upi", "pix"}
+            _entry_country, _payment_country, single_chain = checkout_proxy_route(options)
             exit_pool = entry_pool if single_chain else (options.get("exit_proxies") or entry_pool)
             entry_proxy = options.get("fixed_entry_proxy") or secrets.choice(entry_pool)
             exit_proxy = entry_proxy if single_chain else (options.get("fixed_exit_proxy") or secrets.choice(exit_pool))
@@ -1253,7 +1264,11 @@ class JobStore:
                 self.update(job_id, percent=9, text="第 1/7 步：校验 UPI 印度粘性代理")
                 main_country, main_region = proxy_country(entry_proxy)
                 payment_country, payment_region = proxy_country(exit_proxy)
-                self.log(job_id, f"UPI 代理校验：全流程={main_country}/{main_region}，真实 Session 固定，账单=IN/INR")
+                self.log(
+                    job_id,
+                    f"UPI 双地区校验：优惠入口={main_country}/{main_region}，"
+                    f"支付出口={payment_country}/{payment_region}，账单=IN/INR",
+                )
                 if promo_requested and main_country not in {"TR", "JP"}:
                     self.log(job_id, f"UPI 优惠识别代理当前为 {main_country or '?'}；不限制国家，继续尝试")
                 if payment_country != "IN":
@@ -1368,8 +1383,8 @@ class JobStore:
                 "checkout_country": options.get("checkout_country") or country,
                 "checkout_currency": options.get("checkout_currency") or options["currency"],
                 "entry_proxy_pool_size": int(options.get("entry_proxy_pool_size") or len(entry_pool)),
-                "exit_proxy_pool_size": int(options.get("exit_proxy_pool_size") or len(exit_pool)) if provider == "paypal" else 0,
-                "proxy_mode": "dual_chain" if provider == "paypal" else "single_chain",
+                "exit_proxy_pool_size": int(options.get("exit_proxy_pool_size") or len(exit_pool)) if not single_chain else 0,
+                "proxy_mode": "dual_region" if not single_chain else "single_chain",
                 "entry_exit_ip": getattr(options.get("entry_proxy_probe"), "exit_ip", ""),
                 "entry_proxy_score": getattr(options.get("entry_proxy_probe"), "score", None),
                 "payment_exit_ip": getattr(options.get("exit_proxy_probe"), "exit_ip", ""),
@@ -1750,7 +1765,8 @@ def config():
             "entry_required": False,
             "exit_required_for": [],
             "managed_gateway": bool(CONFIGURED_PROXY_GATEWAY),
-            "single_chain_for": ["hosted", "ideal", "upi", "pix"],
+            "single_chain_for": ["hosted", "ideal", "pix", "upi_without_promo"],
+            "dual_region_for": {"upi_promo": {"entry": "JP", "payment": "IN"}},
             "max_per_pool": 500,
             "selection": "deep_probe_sticky_session",
             "lease_minutes": LEASES.lease_seconds // 60,
@@ -1794,7 +1810,11 @@ def start_checkout():
     exit_raw = data.get("exit_proxies")
     if exit_raw is None:
         exit_raw = data.get("exit_proxy") or data.get("payment_proxy") or ""
+    promo_requested = plan == "plus" and bool(data.get("use_promo", True))
+    dual_region_upi = link_type == "upi" and promo_requested
     if link_type == "paypal" and not exit_raw:
+        exit_raw = CONFIGURED_PROXY_GATEWAY or entry_raw
+    if dual_region_upi and not exit_raw:
         exit_raw = CONFIGURED_PROXY_GATEWAY or entry_raw
     if not entry_raw:
         return jsonify({"error": "服务器尚未配置动态代理网关"}), 503
@@ -1802,7 +1822,11 @@ def start_checkout():
         return jsonify({"error": "服务器尚未配置 PayPal 支付代理网关"}), 503
     try:
         entry_proxies = normalize_proxy_pool(entry_raw, "入口代理")
-        exit_proxies = normalize_proxy_pool(exit_raw, "出口代理") if exit_raw and link_type == "paypal" else []
+        exit_proxies = (
+            normalize_proxy_pool(exit_raw, "出口代理")
+            if exit_raw and (link_type == "paypal" or dual_region_upi)
+            else []
+        )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     if not entry_proxies:
@@ -1847,8 +1871,9 @@ def start_checkout():
         "checkout_country": country,
         "checkout_currency": currency,
         "entry_proxies": entry_proxies,
-        "exit_proxies": exit_proxies if link_type == "paypal" else entry_proxies,
-        "use_promo": bool(data.get("use_promo", True)) if plan == "plus" else False,
+        "exit_proxies": exit_proxies if (link_type == "paypal" or dual_region_upi) else entry_proxies,
+        "use_promo": promo_requested,
+        "promo_proxy_country": "JP" if dual_region_upi else "",
         "promo_campaign": str(data.get("promo_campaign") or "") if plan == "plus" else "",
         "promo_code": str(data.get("promo_code") or "") if plan == "team" else "",
         "workspace_name": str(data.get("workspace_name") or "")[:80],

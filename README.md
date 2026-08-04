@@ -128,7 +128,9 @@ http://username-session-__rotate__-lifetime-120:password@gateway:port
 ```
 
 每轮任务会生成一批真实 sticky session，并并发验证出口 IP、国家、OpenAI 后端和 Stripe。
-iDEAL 支付出口要求 NL，UPI 要求 IN，PIX 要求 BR；重复出口会去重，失败候选进入指数冷却。
+系统会按支付方式自动插入或改写网关用户名中的国家参数：iDEAL=`country-nl`、UPI=`country-in`、
+PIX=`country-br`，并预留 Kakao=`country-kr`。当前版本尚未实现 Kakao 支付协议。
+重复出口会去重，失败候选进入指数冷却。
 选中的入口/支付代理会在完整 Checkout 尝试中复用同一 HTTP Session、Cookie、TLS/UA 指纹和设备标识。
 代理凭据仅应通过网页或环境变量传入。
 

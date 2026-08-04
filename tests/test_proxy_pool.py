@@ -48,6 +48,23 @@ class DynamicSessionTests(unittest.TestCase):
             concrete, _ = proxy_pool.materialize_proxy_url(template)
         self.assertIn("session-candidate001-lifetime-5", unquote(urlsplit(concrete).username or ""))
 
+    def test_country_is_inserted_before_dynamic_session(self) -> None:
+        template = "http://user-session-__rotate__-lifetime-120:secret@gateway.test:6060"
+        routed = proxy_pool.set_rotating_gateway_country(template, "IN")
+        self.assertIn("country-in-session-__rotate__", unquote(urlsplit(routed).username or ""))
+
+    def test_existing_country_is_replaced(self) -> None:
+        template = "http://user-country-us-session-__rotate__-lifetime-120:secret@gateway.test:6060"
+        routed = proxy_pool.set_rotating_gateway_country(template, "NL")
+        username = unquote(urlsplit(routed).username or "")
+        self.assertIn("country-nl-session-__rotate__", username)
+        self.assertNotIn("country-us", username)
+
+    def test_provider_country_mapping_reserves_korea_for_kakao(self) -> None:
+        self.assertEqual(proxy_pool.PROVIDER_PROXY_COUNTRIES["kakao"], "KR")
+        self.assertEqual(proxy_pool.PROVIDER_PROXY_COUNTRIES["upi"], "IN")
+        self.assertEqual(proxy_pool.PROVIDER_PROXY_COUNTRIES["ideal"], "NL")
+
 
 class OptimizerSelectionTests(unittest.TestCase):
     def setUp(self) -> None:

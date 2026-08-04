@@ -22,7 +22,7 @@ from curl_cffi import requests
 
 import stripe_checkout as sc
 from provider_checkout import PROVIDER_DEFAULTS, default_billing, stripe_to_provider
-from proxy_pool import OPTIMIZER, ProxyProbe
+from proxy_pool import OPTIMIZER, PROVIDER_PROXY_COUNTRIES, ProxyProbe
 from sentinel_token import SentinelTokenProvider as BaseSentinel
 
 
@@ -981,13 +981,13 @@ class JobStore:
             entry_pool = current["entry_proxies"]
             exit_pool = current.get("exit_proxies") or entry_pool
             provider = str(current.get("link_type") or "hosted")
-            expected_exit_country = {"pix": "BR", "upi": "IN", "ideal": "NL"}.get(provider, "")
+            target_proxy_country = PROVIDER_PROXY_COUNTRIES.get(provider, "")
             try:
                 entry_probe = OPTIMIZER.select(
                     entry_pool,
                     role="入口",
                     provider=provider,
-                    expected_country="BR" if provider == "pix" else "",
+                    expected_country=target_proxy_country,
                     log=lambda message: self.log(job_id, message),
                 )
                 if provider == "pix":
@@ -997,7 +997,7 @@ class JobStore:
                         exit_pool,
                         role="支付",
                         provider=provider,
-                        expected_country=expected_exit_country,
+                        expected_country=target_proxy_country,
                         log=lambda message: self.log(job_id, message),
                     )
             except Exception as exc:
@@ -1679,7 +1679,8 @@ def config():
             "exit_required_for": ["paypal", "ideal", "upi"],
             "single_chain_for": ["pix"],
             "max_per_pool": 500,
-            "selection": "random_per_job",
+            "selection": "deep_probe_sticky_session",
+            "dynamic_country_routes": PROVIDER_PROXY_COUNTRIES,
         },
         "retry_policy": {"min": 1, "max": 50, "default_pix": 10, "default_other": 3},
         "pix_identity_policy": {"default": "cpf", "auto_kinds": ["cpf", "mixed", "cnpj"], "regenerate_each_attempt": True},

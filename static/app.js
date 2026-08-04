@@ -95,12 +95,12 @@ function syncFields(applyRailDefault=false){
   const recommendations = {
     hosted: '推荐代理：使用账号常用地区。',
     paypal: '\u63a8\u8350\u4ee3\u7406\uff1a\u7cfb\u7edf\u4f18\u5148\u4f7f\u7528\u4ee3\u7406\u6c60 2 \u5f53\u524d\u56fd\u5bb6\u7684 PayPal \u8d26\u5355\uff1b\u82e5\u8be5\u56fd\u5bb6 Checkout \u672a\u5f00\u653e PayPal\uff0c\u5219\u81ea\u52a8\u56de\u9000\u5fb7\u56fd DE/EUR \u8d26\u5355\u3002',
-    ideal: '推荐代理：两个代理池均使用 NL。',
-    upi: '推荐代理：代理池 1 使用可获得优惠资格的国家或地区（如 TR、JP、BR），代理池 2 使用 IN 创建并处理 UPI。',
+    ideal: '动态 rotate 会自动写入 country-nl；固定代理需要 NL 出口。',
+    upi: '动态 rotate 会自动写入 country-in；固定代理需要 IN 出口。',
     pix: '推荐代理：代理池 1 使用 BR。'
   };
   const pool2Hints = {paypal:'巴西 PayPal 推荐 BR',ideal:'推荐 NL',upi:'推荐 IN'};
-  const recommendation = `${recommendations[rail] || '推荐代理：使用与所选地区一致的代理。'} 动态网关可用 __rotate__，任务会先深度探测再固定 session。`;
+  const recommendation = `${recommendations[rail] || '推荐代理：使用与所选地区一致的代理。'} 动态网关可用 __rotate__，国家参数由支付方式自动填写。`;
   $('proxyRecommendation').textContent = recommendation;
   $('proxyFootHint').textContent = recommendation;
   $('exitProxyHint').textContent = pool2Hints[rail] || '推荐同地区';

@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from curl_cffi.requests import Session as CffiSession
 
@@ -18,6 +18,14 @@ from curl_cffi.requests import Session as CffiSession
 _SESSION_MARKERS = ("__rotate__", "{session}", "%7bsession%7d")
 _SESSION_WORD_RE = re.compile(r"(?i)(-session-)rotate(?=-)")
 _LIFETIME_RE = re.compile(r"(?i)(?:^|-)lifetime-(\d+)(?:-|$)")
+_COUNTRY_RE = re.compile(r"(?i)(-country-)([a-z]{2})(?=-|$)")
+
+PROVIDER_PROXY_COUNTRIES = {
+    "kakao": "KR",
+    "upi": "IN",
+    "ideal": "NL",
+    "pix": "BR",
+}
 
 
 @dataclass(frozen=True)
@@ -78,8 +86,38 @@ def is_dynamic_template(proxy_url: str) -> bool:
     return any(marker in lowered for marker in _SESSION_MARKERS) or bool(_SESSION_WORD_RE.search(lowered))
 
 
-def materialize_proxy_url(proxy_url: str) -> tuple[str, float]:
+def set_rotating_gateway_country(proxy_url: str, country: str) -> str:
     raw = str(proxy_url or "")
+    code = re.sub(r"[^a-z]", "", str(country or "").lower())
+    if len(code) != 2 or not is_dynamic_template(raw):
+        return raw
+    parsed = urlsplit(raw)
+    username = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+    if _COUNTRY_RE.search(username):
+        username = _COUNTRY_RE.sub(lambda match: f"{match.group(1)}{code}", username, count=1)
+    elif "-session-" in username.lower():
+        username = re.sub(
+            r"(?i)(-session-)",
+            f"-country-{code}-session-",
+            username,
+            count=1,
+        )
+    else:
+        return raw
+
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = host + (f":{parsed.port}" if parsed.port else "")
+    auth = quote(username, safe="")
+    if parsed.password is not None:
+        auth += ":" + quote(password, safe="")
+    return urlunsplit((parsed.scheme, f"{auth}@{netloc}", parsed.path, parsed.query, parsed.fragment))
+
+
+def materialize_proxy_url(proxy_url: str, *, country: str = "") -> tuple[str, float]:
+    raw = set_rotating_gateway_country(str(proxy_url or ""), country)
     if not is_dynamic_template(raw):
         return raw, 0.0
 
@@ -98,8 +136,6 @@ def materialize_proxy_url(proxy_url: str) -> tuple[str, float]:
     if parsed.port:
         netloc += f":{parsed.port}"
     if username:
-        from urllib.parse import quote
-
         auth = quote(username, safe="")
         if password:
             auth += ":" + quote(password, safe="")
@@ -322,7 +358,9 @@ class ProxyPoolOptimizer:
             self._cache[proxy_url] = (time.time(), probe)
         return probe
 
-    def _materialize_candidates(self, pool: list[str], count: int) -> list[tuple[str, float]]:
+    def _materialize_candidates(
+        self, pool: list[str], count: int, *, country: str = "",
+    ) -> list[tuple[str, float]]:
         candidates: list[tuple[str, float]] = []
         seen: set[str] = set()
         templates = list(dict.fromkeys(pool))
@@ -335,7 +373,7 @@ class ProxyPoolOptimizer:
             template = templates[cursor % len(templates)]
             cursor += 1
             attempts += 1
-            concrete, expires_at = materialize_proxy_url(template)
+            concrete, expires_at = materialize_proxy_url(template, country=country)
             if concrete in seen or self._in_cooldown(concrete):
                 continue
             seen.add(concrete)
@@ -344,7 +382,7 @@ class ProxyPoolOptimizer:
                 break
         if not candidates:
             for template in templates:
-                concrete, expires_at = materialize_proxy_url(template)
+                concrete, expires_at = materialize_proxy_url(template, country=country)
                 if concrete not in seen:
                     candidates.append((concrete, expires_at))
         return candidates
@@ -361,7 +399,7 @@ class ProxyPoolOptimizer:
         candidate_count = min(self.probe_count, max(1, len(pool)))
         if any(is_dynamic_template(item) for item in pool):
             candidate_count = self.probe_count
-        candidates = self._materialize_candidates(pool, candidate_count)
+        candidates = self._materialize_candidates(pool, candidate_count, country=expected_country)
         if not candidates:
             raise RuntimeError(f"{role}代理池没有可用候选")
 

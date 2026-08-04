@@ -89,24 +89,7 @@
         </div>
         <p id="regionAutoHint" class="region-auto-hint" hidden>PayPal 的国家、地区和币种会根据代理池 2 自动识别。</p>
 
-        <section class="proxy-block" aria-labelledby="proxyTitle">
-          <div class="block-heading">
-            <div><span class="section-index">P</span><div><h3 id="proxyTitle">代理池</h3><p id="proxyRecommendation">每行填写一个代理；动态网关可用 -session-__rotate__-，系统会实测后选择 sticky session。</p></div></div>
-            <div class="block-tags"><span id="proxySaveState" class="local-save-tag">本地自动保存</span><span class="required-tag">任务必填</span></div>
-          </div>
-          <div class="two-cols" id="proxyGrid">
-            <label class="field"><span>代理池 1 <small id="entryProxyCount">0 / 500</small></span><textarea id="entryProxy" class="proxy-pool-input" required autocomplete="off" spellcheck="false" placeholder="每行一个代理；动态 session 使用 __rotate__ 占位"></textarea></label>
-            <label class="field" id="exitProxyField" hidden><span>代理池 2 <small><i id="exitProxyHint">推荐代理</i> · <b id="exitProxyCount">0 / 500</b></small></span><textarea id="exitProxy" class="proxy-pool-input" autocomplete="off" spellcheck="false" placeholder="每行一个代理，支持 1-500 条"></textarea></label>
-          </div>
-          <div class="retry-setting">
-            <label class="field"><span>失败重试次数 <small>1-50 次</small></span><input id="retryCount" type="number" min="1" max="50" value="10"></label>
-            <p>任务未成功时会自动更换代理重新尝试，无需手动重复提交。</p>
-          </div>
-          <div class="proxy-foot">
-            <span id="proxyFootHint">推荐代理会根据所选支付方式自动显示。</span>
-            <button id="copyEntryProxy" type="button">复制代理池 1 到代理池 2</button>
-          </div>
-        </section>
+        <label class="field retry-field"><span>失败重试次数 <small>1-50 次</small></span><input id="retryCount" type="number" min="1" max="50" value="10"></label>
 
         <div id="teamFields" class="conditional-fields" hidden>
           <div class="two-cols">
@@ -202,6 +185,6 @@
   </main>
 
   <footer><span>PAY.153.INK</span><p>任务完成后请及时使用链接；支付提供商生成的二维码通常具有有效期。</p></footer>
-  <script src="/static/app.js?v=20260804-atlease01"></script>
+  <script src="/static/app.js?v=20260804-managedproxy01"></script>
 </body>
 </html>

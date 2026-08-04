@@ -8,14 +8,8 @@ let targetProgress = 0;
 let progressStatus = 'idle';
 let progressFrame = 0;
 let progressLastTick = 0;
-let proxySaveTimer = 0;
 let logAutoFollow = true;
 let renderedLogKey = '';
-
-const PROXY_STORAGE_KEYS = {
-  entry: 'pay153.proxy_pool_1',
-  exit: 'pay153.proxy_pool_2'
-};
 
 const providerDefaults = {
   hosted: {country: 'US', currency: 'USD'}, paypal: {country: 'US', currency: 'USD'},
@@ -23,45 +17,6 @@ const providerDefaults = {
   pix: {country: 'BR', currency: 'BRL'}
 };
 const countryCurrency = {US:'USD',DE:'EUR',FR:'EUR',NL:'EUR',IN:'INR',BR:'BRL',GB:'GBP',JP:'JPY',AU:'AUD',CA:'CAD'};
-
-function proxyLines(node){
-  return node.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-}
-function updateProxyCount(node, counter){
-  const count = proxyLines(node).length;
-  counter.textContent = `${count} / 500`;
-  counter.classList.toggle('over-limit', count > 500);
-  node.setCustomValidity(count > 500 ? '每个代理池最多填写 500 条' : '');
-  return count;
-}
-function setProxySaveState(text, failed=false){
-  const node = $('proxySaveState');
-  node.textContent = text;
-  node.classList.toggle('save-failed', failed);
-}
-function saveProxyPools(){
-  clearTimeout(proxySaveTimer);
-  proxySaveTimer = setTimeout(() => {
-    try {
-      localStorage.setItem(PROXY_STORAGE_KEYS.entry, $('entryProxy').value);
-      localStorage.setItem(PROXY_STORAGE_KEYS.exit, $('exitProxy').value);
-      setProxySaveState('已保存到本机');
-    } catch (error) {
-      setProxySaveState('本地保存失败', true);
-    }
-  }, 220);
-}
-function restoreProxyPools(){
-  try {
-    const entry = localStorage.getItem(PROXY_STORAGE_KEYS.entry);
-    const exit = localStorage.getItem(PROXY_STORAGE_KEYS.exit);
-    if (entry !== null) $('entryProxy').value = entry;
-    if (exit !== null) $('exitProxy').value = exit;
-    setProxySaveState(entry !== null || exit !== null ? '已恢复本地代理' : '本地自动保存');
-  } catch (error) {
-    setProxySaveState('本地保存不可用', true);
-  }
-}
 
 function selected(name){ return form.querySelector(`input[name="${name}"]:checked`)?.value || ''; }
 function bindChoices(group, onChange){
@@ -87,23 +42,6 @@ function syncFields(applyRailDefault=false){
   const promoSupported = plan === 'plus';
   $('promoLine').style.display = promoSupported ? 'flex' : 'none';
   $('plusPromoFields').hidden = !promoSupported || !$('usePromo').checked;
-  const needsExit = rail === 'paypal';
-  $('proxyGrid').classList.toggle('single', !needsExit);
-  $('exitProxyField').hidden = !needsExit;
-  $('exitProxy').required = needsExit;
-  $('copyEntryProxy').hidden = !needsExit;
-  const recommendations = {
-    hosted: '推荐代理：使用账号常用地区。',
-    paypal: '\u63a8\u8350\u4ee3\u7406\uff1a\u7cfb\u7edf\u4f18\u5148\u4f7f\u7528\u4ee3\u7406\u6c60 2 \u5f53\u524d\u56fd\u5bb6\u7684 PayPal \u8d26\u5355\uff1b\u82e5\u8be5\u56fd\u5bb6 Checkout \u672a\u5f00\u653e PayPal\uff0c\u5219\u81ea\u52a8\u56de\u9000\u5fb7\u56fd DE/EUR \u8d26\u5355\u3002',
-    ideal: '单代理池全程复用；动态 rotate 自动写入 country-nl，固定代理需要 NL 出口。',
-    upi: '单代理池全程复用；动态 rotate 自动写入 country-in，固定代理需要 IN 出口。',
-    pix: '单代理池全程复用；动态 rotate 自动写入 country-br，固定代理需要 BR 出口。'
-  };
-  const pool2Hints = {paypal:'巴西 PayPal 推荐 BR'};
-  const recommendation = `${recommendations[rail] || '推荐代理：使用与所选地区一致的代理。'} 动态网关可用 __rotate__，国家参数由支付方式自动填写。`;
-  $('proxyRecommendation').textContent = recommendation;
-  $('proxyFootHint').textContent = recommendation;
-  $('exitProxyHint').textContent = pool2Hints[rail] || '推荐同地区';
   if (applyRailDefault && providerDefaults[rail]) {
     $('country').value = providerDefaults[rail].country;
     $('currency').value = providerDefaults[rail].currency;
@@ -111,14 +49,6 @@ function syncFields(applyRailDefault=false){
 }
 $('country').addEventListener('change', () => $('currency').value = countryCurrency[$('country').value] || 'USD');
 $('usePromo').addEventListener('change', () => syncFields(false));
-$('entryProxy').addEventListener('input', () => { updateProxyCount($('entryProxy'), $('entryProxyCount')); saveProxyPools(); });
-$('exitProxy').addEventListener('input', () => { updateProxyCount($('exitProxy'), $('exitProxyCount')); saveProxyPools(); });
-$('copyEntryProxy').addEventListener('click', () => {
-  $('exitProxy').value = $('entryProxy').value.trim();
-  updateProxyCount($('exitProxy'), $('exitProxyCount'));
-  saveProxyPools();
-  $('exitProxy').focus();
-});
 
 function paintProgress(value){
   const p = Math.max(0, Math.min(100, value));
@@ -272,7 +202,7 @@ form.addEventListener('submit', async (event) => {
   const plan = selected('plan');
   const body = {
     token: $('token').value, plan, link_type: selected('link_type'), country: $('country').value,
-    currency: $('currency').value, entry_proxies: proxyLines($('entryProxy')), exit_proxies: proxyLines($('exitProxy')),
+    currency: $('currency').value,
     retry_count: Math.max(1, Math.min(50, Number($('retryCount').value || 10))),
     use_promo: plan === 'plus' && $('usePromo').checked,
     promo_campaign: plan === 'plus' ? $('promoCampaign').value.trim() : '',
@@ -315,8 +245,5 @@ applyTheme(requestedTheme ? requestedTheme === 'dark' : (saved ? saved==='dark' 
 $('themeToggle').addEventListener('click',()=>applyTheme(!document.documentElement.classList.contains('dark')));
 $('refreshLeases').addEventListener('click', refreshProxyLeases);
 syncFields(true);
-restoreProxyPools();
-updateProxyCount($('entryProxy'), $('entryProxyCount'));
-updateProxyCount($('exitProxy'), $('exitProxyCount'));
 refreshProxyLeases();
 setInterval(refreshProxyLeases, 60000);

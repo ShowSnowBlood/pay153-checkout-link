@@ -286,14 +286,45 @@ class ProxyLeaseApiTests(unittest.TestCase):
             return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
         return f"{encode({'alg': 'none'})}.{encode({'exp': int(time.time()) + 3600})}.signature"
 
-    def test_config_only_requires_second_pool_for_paypal(self) -> None:
+    def test_config_exposes_managed_gateway_without_requiring_proxy_inputs(self) -> None:
         import app as checkout_app
 
-        response = checkout_app.app.test_client().get("/api/config")
+        with patch.object(checkout_app, "CONFIGURED_PROXY_GATEWAY", "managed-gateway"):
+            response = checkout_app.app.test_client().get("/api/config")
         policy = response.get_json()["proxy_policy"]
-        self.assertEqual(policy["exit_required_for"], ["paypal"])
+        self.assertFalse(policy["entry_required"])
+        self.assertEqual(policy["exit_required_for"], [])
+        self.assertTrue(policy["managed_gateway"])
         self.assertIn("upi", policy["single_chain_for"])
         self.assertIn("ideal", policy["single_chain_for"])
+
+    def test_managed_gateway_creates_upi_request_without_client_proxy(self) -> None:
+        import app as checkout_app
+
+        captured: dict = {}
+        gateway = "http://rp.scrapegw.com:6060:sample-user:sample-password"
+
+        def create(options: dict) -> str:
+            captured.update(options)
+            return "job-managed"
+
+        payload = {"token": self.jwt(), "plan": "plus", "link_type": "upi"}
+        with patch.object(checkout_app, "CONFIGURED_PROXY_GATEWAY", gateway), \
+             patch.object(checkout_app.STORE, "create", side_effect=create), \
+             patch.object(checkout_app.STORE, "queue_position", return_value=0), \
+             patch.object(checkout_app.IP_TASK_LIMITER, "acquire", return_value=(True, 0)):
+            response = checkout_app.app.test_client().post("/api/checkout", json=payload)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(captured["entry_proxies"], captured["exit_proxies"])
+        self.assertTrue(proxy_pool.is_dynamic_template(captured["entry_proxies"][0]))
+
+    def test_frontend_has_no_proxy_pool_inputs(self) -> None:
+        source = (Path(__file__).parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+        script = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn('id="entryProxy"', source)
+        self.assertNotIn('id="exitProxy"', source)
+        self.assertNotIn("entry_proxies:", script)
 
     def test_upi_request_uses_entry_pool_for_both_sides(self) -> None:
         import app as checkout_app

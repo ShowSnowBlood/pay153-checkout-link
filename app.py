@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parent
 BACKEND_LOG_DIR = Path(os.getenv("PAY153_LOG_DIR", str(ROOT / "logs")))
 LEASES = ProxyLeaseRegistry(os.getenv("PAY153_PROXY_LEASE_FILE", str(ROOT / "data" / "proxy_leases.json")))
 LEGACY_SERVICE_BASE = str(os.getenv("PAY153_LEGACY_BASE", "")).rstrip("/")
+CONFIGURED_PROXY_GATEWAY = str(os.getenv("PAY153_PROXY_GATEWAY", "")).strip()
 app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
 app.config["JSON_AS_ASCII"] = False
 
@@ -1746,8 +1747,9 @@ def config():
         "country_currency": COUNTRY_CURRENCY,
         "provider_defaults": PROVIDER_DEFAULTS,
         "proxy_policy": {
-            "entry_required": True,
-            "exit_required_for": ["paypal"],
+            "entry_required": False,
+            "exit_required_for": [],
+            "managed_gateway": bool(CONFIGURED_PROXY_GATEWAY),
             "single_chain_for": ["hosted", "ideal", "upi", "pix"],
             "max_per_pool": 500,
             "selection": "deep_probe_sticky_session",
@@ -1788,14 +1790,16 @@ def start_checkout():
     currency, _currency_source = normalize_checkout_currency(country, requested_currency)
     entry_raw = data.get("entry_proxies")
     if entry_raw is None:
-        entry_raw = data.get("entry_proxy") or data.get("api_proxy") or data.get("proxy") or ""
+        entry_raw = data.get("entry_proxy") or data.get("api_proxy") or data.get("proxy") or CONFIGURED_PROXY_GATEWAY
     exit_raw = data.get("exit_proxies")
     if exit_raw is None:
         exit_raw = data.get("exit_proxy") or data.get("payment_proxy") or ""
-    if not entry_raw:
-        return jsonify({"error": "请填写 Checkout 入口代理"}), 400
     if link_type == "paypal" and not exit_raw:
-        return jsonify({"error": "当前支付路径需要填写支付出口代理"}), 400
+        exit_raw = CONFIGURED_PROXY_GATEWAY or entry_raw
+    if not entry_raw:
+        return jsonify({"error": "服务器尚未配置动态代理网关"}), 503
+    if link_type == "paypal" and not exit_raw:
+        return jsonify({"error": "服务器尚未配置 PayPal 支付代理网关"}), 503
     try:
         entry_proxies = normalize_proxy_pool(entry_raw, "入口代理")
         exit_proxies = normalize_proxy_pool(exit_raw, "出口代理") if exit_raw and link_type == "paypal" else []

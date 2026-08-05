@@ -678,7 +678,7 @@ def promo_campaign_from_payload(payload: Any) -> str:
 
 
 def upi_promo_is_explicitly_unavailable(payload: Any) -> bool:
-    """Return true only when the server denies the marker and no campaign exists."""
+    """Reject an authoritative Checkout response with no native campaign."""
     return (
         isinstance(payload, dict)
         and payload.get("one_click_trial_eligible") is False
@@ -1482,8 +1482,6 @@ class JobStore:
                     options["promo_campaign"] = detected_campaign
                     options["promo_campaign_verified"] = True
                     self.log(job_id, f"优惠预检已匹配账号活动：{detected_campaign}")
-                if provider == "upi" and upi_promo_is_explicitly_unavailable(preflight):
-                    raise RuntimeError("upi_promo_not_eligible")
                 self.ensure_not_cancelled(job_id)
 
             self.update(job_id, percent=18, text="生成 Sentinel 校验")
@@ -1545,6 +1543,7 @@ class JobStore:
                 and promo_requested
                 and upi_promo_is_explicitly_unavailable(checkout_data)
             ):
+                self.log(job_id, "UPI 原生优惠 Checkout 未返回可用 campaign，停止零金额流程")
                 raise RuntimeError("upi_promo_not_eligible")
             provider_chatgpt_http = chatgpt_http
             promo_chatgpt_http = chatgpt_http

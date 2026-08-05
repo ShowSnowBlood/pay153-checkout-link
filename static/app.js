@@ -168,17 +168,17 @@ function showResult(result){
       : result.promo_applied === false
         ? '未生效'
         : '打开结账页确认';
-  if (String(result.link_type || '').toLowerCase() === 'upi') {
+  const isUpi = String(result.link_type || '').toLowerCase() === 'upi';
+  if (isUpi) {
     const mandateSource = String(result.upi_mandate_source || '').toLowerCase();
     if (mandateSource === 'local') promoText += ' · AutoPay 本地补全';
     else if (mandateSource === 'server') promoText += ' · AutoPay 服务端';
-    if (result.fallback_reason) promoText += ' · 官方页兜底';
   }
   $('resultPromo').textContent = promoText;
   $('resultSession').textContent = result.checkout_session_id || '—';
-  const finalValue = result.qr_data || result.provider_redirect_url || result.checkout_url || '';
+  const finalValue = result.qr_data || result.provider_redirect_url || (isUpi ? '' : result.checkout_url) || '';
   $('resultValue').value = finalValue;
-  const openUrl = result.provider_redirect_url || result.checkout_url || '';
+  const openUrl = result.provider_redirect_url || (isUpi ? '' : result.checkout_url) || '';
   $('openResult').href = openUrl || '#';
   $('openResult').style.display = openUrl ? 'inline-flex' : 'none';
   const qr = result.qr_image_png || result.qr_image_svg || '';

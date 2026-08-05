@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import unquote, urlsplit
 
 import proxy_pool
@@ -279,6 +279,176 @@ class ApprovalSessionCandidateTests(unittest.TestCase):
             payload["promo_campaign"]["promo_campaign_id"],
             "plus-1-month-free",
         )
+
+
+class UpiPromoEligibilityTests(unittest.TestCase):
+    def test_false_marker_without_campaign_is_explicitly_unavailable(self) -> None:
+        from app import upi_promo_is_explicitly_unavailable
+
+        self.assertTrue(upi_promo_is_explicitly_unavailable({
+            "one_click_trial_eligible": False,
+        }))
+
+    def test_campaign_overrides_false_marker_at_top_level_or_nested(self) -> None:
+        from app import upi_promo_is_explicitly_unavailable
+
+        payloads = (
+            {
+                "one_click_trial_eligible": False,
+                "promo_campaign_id": "plus-top-level",
+            },
+            {
+                "one_click_trial_eligible": False,
+                "data": {
+                    "promotions": [
+                        {"campaign_id": "plus-nested"},
+                    ],
+                },
+            },
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertFalse(upi_promo_is_explicitly_unavailable(payload))
+
+    def test_true_none_or_empty_payload_is_not_explicitly_unavailable(self) -> None:
+        from app import upi_promo_is_explicitly_unavailable
+
+        payloads = (
+            {"one_click_trial_eligible": True},
+            None,
+            {},
+            "",
+            [],
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertFalse(upi_promo_is_explicitly_unavailable(payload))
+
+
+class UpiResultContractTests(unittest.TestCase):
+    def test_upi_requires_real_action(self) -> None:
+        from app import UPI_NEXT_ACTION_TYPE, validate_provider_result
+
+        with self.assertRaisesRegex(RuntimeError, "upi_no_action_after_confirm"):
+            validate_provider_result("upi", {"checkout_url": "https://example.com/checkout"})
+        with self.assertRaisesRegex(RuntimeError, "upi_invalid_fallback_result"):
+            validate_provider_result("upi", {
+                "provider_redirect_url": "https://pay.openai.com/c/pay/cs_test",
+                "fallback_reason": "placeholder",
+            })
+        with self.assertRaisesRegex(RuntimeError, "upi_promo_not_applied"):
+            validate_provider_result("upi", {
+                "provider_redirect_url": "https://hooks.stripe.com/upi/paid",
+                "next_action_type": UPI_NEXT_ACTION_TYPE,
+                "promo_requested": True,
+                "promo_applied": None,
+            })
+        validate_provider_result("upi", {
+            "qr_image_svg": "https://example.com/upi.svg",
+            "next_action_type": UPI_NEXT_ACTION_TYPE,
+        })
+
+    def test_upi_rejects_checkout_page_urls_without_fallback_marker(self) -> None:
+        from app import UPI_NEXT_ACTION_TYPE, validate_provider_result
+
+        for checkout_url in (
+            "https://pay.openai.com/c/pay/cs_test",
+            "https://checkout.stripe.com/c/pay/cs_test",
+        ):
+            with self.subTest(checkout_url=checkout_url):
+                with self.assertRaisesRegex(RuntimeError, "upi_checkout_url_is_not_action"):
+                    validate_provider_result("upi", {
+                        "provider_redirect_url": checkout_url,
+                        "next_action_type": UPI_NEXT_ACTION_TYPE,
+                    })
+
+    def test_upi_real_action_requires_upi_next_action_type(self) -> None:
+        from app import UPI_NEXT_ACTION_TYPE, validate_provider_result
+
+        with self.assertRaisesRegex(RuntimeError, "upi_invalid_next_action_type"):
+            validate_provider_result("upi", {
+                "provider_redirect_url": "https://hooks.stripe.com/upi/real",
+            })
+        validate_provider_result("upi", {
+            "provider_redirect_url": "https://hooks.stripe.com/upi/real",
+            "next_action_type": UPI_NEXT_ACTION_TYPE,
+        })
+
+    def test_upi_promo_true_still_requires_zero_checkout_amount(self) -> None:
+        from app import UPI_NEXT_ACTION_TYPE, validate_provider_result
+
+        with self.assertRaisesRegex(RuntimeError, "upi_checkout_amount_not_zero"):
+            validate_provider_result("upi", {
+                "provider_redirect_url": "https://hooks.stripe.com/upi/paid",
+                "next_action_type": UPI_NEXT_ACTION_TYPE,
+                "promo_requested": True,
+                "promo_applied": True,
+                "checkout_amount": 199900,
+            })
+
+    def test_record_success_persists_upi_image_action_instead_of_checkout_url(self) -> None:
+        import app as checkout_app
+
+        store = object.__new__(checkout_app.JobStore)
+        store.file_lock = checkout_app.threading.RLock()
+        image_actions = {
+            "png-job": ("qr_image_png", "https://example.com/upi.png"),
+            "svg-job": ("qr_image_svg", "https://example.com/upi.svg"),
+        }
+
+        with tempfile.TemporaryDirectory() as tempdir, \
+             patch.object(checkout_app, "ROOT", Path(tempdir)):
+            for job_id, (action_kind, action_value) in image_actions.items():
+                store._record_success(job_id, {
+                    "link_type": "upi",
+                    "checkout_url": "https://pay.openai.com/c/pay/cs_placeholder",
+                    "next_action_type": checkout_app.UPI_NEXT_ACTION_TYPE,
+                    action_kind: action_value,
+                })
+
+            records = [
+                json.loads(line)
+                for line in (Path(tempdir) / "data" / "success_links.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        by_job = {record["job_id"]: record for record in records}
+        self.assertEqual(set(by_job), set(image_actions))
+        for job_id, (action_kind, action_value) in image_actions.items():
+            with self.subTest(job_id=job_id):
+                self.assertEqual(by_job[job_id]["action_kind"], action_kind)
+                self.assertEqual(by_job[job_id]["action_value"], action_value)
+                self.assertEqual(by_job[job_id]["url"], action_value)
+                self.assertNotIn("checkout_url", by_job[job_id])
+
+    def test_custom_checkout_does_not_synthesize_hosted_url(self) -> None:
+        import app as checkout_app
+
+        http = Mock()
+        http.cookies = Mock()
+        http.get.return_value = Mock(status_code=200, text="", url="https://chatgpt.com/")
+        response = Mock(status_code=200, text='{"checkout_session_id":"cs_test_custom"}')
+        response.json.return_value = {"checkout_session_id": "cs_test_custom"}
+        http.post.return_value = response
+
+        with patch.object(
+            checkout_app,
+            "sentinel_headers",
+            new=AsyncMock(return_value={}),
+        ):
+            created = checkout_app.create_checkout(
+                "token",
+                {"checkout_ui_mode": "custom"},
+                "http://proxy.test:8080",
+                "device",
+                "did",
+                lambda _message: None,
+                http=http,
+            )
+
+        self.assertEqual(created["data"]["checkout_session_id"], "cs_test_custom")
+        self.assertEqual(created["data"]["checkout_url"], "")
 
 
 class ProxyLeaseRegistryTests(unittest.TestCase):

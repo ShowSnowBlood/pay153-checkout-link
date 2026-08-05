@@ -7,6 +7,7 @@ import random
 import re
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
 from datetime import date, timedelta
 from typing import Any, Callable
@@ -35,6 +36,33 @@ HOSTED_CHECKOUT_STRIPE_VERSION = (
     "checkout_server_update_beta=v1; checkout_manual_approval_preview=v1"
 )
 HOSTED_CHECKOUT_RUNTIME_VERSION = "e1fb22ad35"
+UPI_NEXT_ACTION_TYPE = "upi_handle_redirect_or_display_qr_code"
+
+
+def amount_is_zero(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    try:
+        amount = Decimal(text)
+    except InvalidOperation:
+        return False
+    return amount.is_finite() and amount == 0
+
+
+def _amount_is_positive(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    try:
+        amount = Decimal(text)
+    except InvalidOperation:
+        return False
+    return amount.is_finite() and amount > 0
 
 
 def generate_cpf() -> str:
@@ -89,6 +117,31 @@ def provider_failure_detail(data: dict) -> str:
         if text:
             values.append(f"{label}={text[:220]}")
     return "; ".join(values)
+
+
+def provider_terminal_failure_detail(data: dict) -> str:
+    """Return failure detail only for states that cannot produce a valid action."""
+    submission = data.get("submission_attempt") or {}
+    setup_intent = data.get("setup_intent") or {}
+    payment_intent = data.get("payment_intent") or {}
+    submission_state = str(submission.get("state") or "").lower()
+    setup_status = str(setup_intent.get("status") or "").lower()
+    payment_status = str(payment_intent.get("status") or "").lower()
+    terminal_states = {
+        "canceled",
+        "cancelled",
+        "failed",
+        "requires_confirmation",
+        "requires_payment_method",
+    }
+    if (
+        payment_decline(data)
+        or submission_state in {"canceled", "cancelled", "failed"}
+        or setup_status in terminal_states
+        or payment_status in terminal_states
+    ):
+        return provider_failure_detail(data) or "terminal_provider_state"
+    return ""
 
 
 def extract_payment_method_id(*sources: Any) -> str:
@@ -271,8 +324,9 @@ def recover_upi_via_payment_page(
 
     Stripe rejects ``setup_intents/{id}/confirm`` for Checkout-created SetupIntents
     (\"You cannot confirm SetupIntents created by Checkout.\"). After merchant
-    approval fails with setup_attempt_failed, re-submit via payment_pages/confirm
-    with a fresh pm_* only when the live intent supplied AutoPay mandate data.
+    approval fails, re-submit via payment_pages/confirm. Prefer the pm_* that was
+    attached before a late promotion; only create a fresh inline attempt when
+    the current intent also supplied AutoPay mandate data.
 
     Important: never send both ``Stripe-Version`` header and body
     ``_stripe_version`` — Stripe returns 400 invalid_request_error.
@@ -286,11 +340,8 @@ def recover_upi_via_payment_page(
 
     server_options = dict(ctx.get("provider_payment_method_options") or {})
     mandate = dict(server_options.get("mandate_options") or {})
-    if not mandate:
-        log("[upi] 服务端未配置 UPI AutoPay mandate，跳过 Payment Page 补交")
-        return {}
     ctx["provider_payment_method_options"] = server_options
-    ctx["server_upi_mandate_present"] = True
+    ctx["server_upi_mandate_present"] = bool(mandate)
     ctx["local_mandate_synthesized"] = False
     return_url = str(ctx.get("stripe_hosted_url") or ctx.get("return_url") or "https://chatgpt.com/")
     last_page: dict = {}
@@ -300,27 +351,32 @@ def recover_upi_via_payment_page(
         sc.STRIPE_VERSION_BASE,
     )
 
-    # Zero-only mode needs fast fail: one round, two variants, stop after first
-    # post-approve setup_attempt_failed so outer retry can rotate account/IP.
+    # Zero-only mode uses one bounded round. A late-promo attempt may have no
+    # explicit mandate payload but still has the already-attached pm_*.
     for round_idx in range(1, 2):
-        try:
-            pm_id = create_provider_payment_method(
-                http, pk, session_id, "upi", version, ctx, billing, log,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log(f"[upi] Payment Page 补交创建 pm 失败：{type(exc).__name__}: {exc}")
-            pm_id = str(ctx.get("payment_method_id") or "")
+        pm_id = str(ctx.get("payment_method_id") or "")
+        if mandate and not pm_id.startswith("pm_"):
+            try:
+                pm_id = create_provider_payment_method(
+                    http, pk, session_id, "upi", version, ctx, billing, log,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log(f"[upi] Payment Page 补交创建 pm 失败：{type(exc).__name__}: {exc}")
         if not str(pm_id).startswith("pm_"):
-            log("[upi] Payment Page 补交缺少 pm_*，停止")
+            log("[upi] Payment Page 补交缺少已挂载 pm_*，停止")
             break
         ctx["payment_method_id"] = pm_id
 
-        # Payment Page revisions expect provider options beside inline PM data.
-        # Preserve the server-owned mandate exactly; do not create variants.
+        # Reuse the pre-promotion PaymentMethod first. With a server mandate,
+        # retain one inline fallback that preserves those options exactly.
         addr = (billing or {}).get("address") or {}
         variants: list[tuple[str, dict]] = [
-            ("pp_inline_server", {"mode": "inline"}),
+            ("pp_existing_pm", {"mode": "pm_id", "payment_method": pm_id}),
         ]
+        if mandate:
+            variants.append(("pp_inline_server", {"mode": "inline"}))
+        else:
+            log("[upi] 服务端未返回 AutoPay mandate，使用归零前已挂载 pm_* 做一次受控补交")
         # Prefer Payment Page init train (basil) first — matches zero Checkout.
         version_candidates = (
             sc.STRIPE_VERSION_FULL,
@@ -341,7 +397,7 @@ def recover_upi_via_payment_page(
                     ),
                 }
                 if options.get("mode") == "pm_id":
-                    body["payment_method"] = pm_id
+                    body["payment_method"] = str(options.get("payment_method") or pm_id)
                 else:
                     # Inline PM + mandate under payment_method_data (browser shape).
                     body.update({
@@ -754,13 +810,44 @@ def extract_server_provider_options(init_resp: dict, provider: str) -> dict:
         options = payment_method_options.get(provider)
         if not isinstance(options, dict):
             continue
-        for key, value in options.items():
-            if value in (None, {}) and merged.get(key):
-                continue
-            if isinstance(value, dict) and isinstance(merged.get(key), dict):
-                merged[key] = {**merged[key], **value}
-            else:
-                merged[key] = value
+        _merge_nonempty_server_options(merged, options)
+    return merged
+
+
+def _merge_nonempty_server_options(base: dict, incoming: dict) -> dict:
+    """Merge server data without letting empty values erase valid fields."""
+    for key, value in incoming.items():
+        if value is None or value == "" or value == {} or value == []:
+            continue
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _merge_nonempty_server_options(base[key], value)
+        elif isinstance(value, dict):
+            base[key] = _merge_nonempty_server_options({}, value)
+        else:
+            base[key] = value
+    return base
+
+
+def merge_server_provider_options(
+    ctx: dict,
+    provider: str,
+    *payloads: dict,
+    reset: bool = False,
+) -> dict:
+    """Merge provider options observed across Stripe server responses."""
+    merged: dict = {}
+    if not reset:
+        _merge_nonempty_server_options(
+            merged,
+            dict(ctx.get("provider_payment_method_options") or {}),
+        )
+    for payload in payloads:
+        options = extract_server_provider_options(payload, provider)
+        _merge_nonempty_server_options(merged, options)
+    if merged:
+        ctx["provider_payment_method_options"] = merged
+    elif reset:
+        ctx.pop("provider_payment_method_options", None)
     return merged
 
 
@@ -790,11 +877,21 @@ def build_local_mandate_options(provider: str, ctx: dict, server_options: dict |
 
 
 def provider_has_action(result: dict) -> bool:
-    return bool(
+    if result.get("fallback_reason"):
+        return False
+    has_action = bool(
         result.get("provider_redirect_url")
         or result.get("qr_image_png")
+        or result.get("qr_image_svg")
         or result.get("qr_data")
     )
+    if str(result.get("provider") or "").lower() == "upi":
+        if not has_action or result.get("next_action_type") != UPI_NEXT_ACTION_TYPE:
+            return False
+        redirect = str(result.get("provider_redirect_url") or "")
+        redirect_host = str(urlsplit(redirect).hostname or "").lower() if redirect else ""
+        return redirect_host not in {"pay.openai.com", "checkout.stripe.com"}
+    return has_action
 
 
 def default_billing(country: str, email: str = "", tax_id: str = "", geo: dict[str, str] | None = None, real_random: bool = False) -> dict[str, Any]:
@@ -1151,7 +1248,16 @@ def confirm_upi_hosted_minimal(
 
     version_candidates = [sc.STRIPE_VERSION_FULL]
 
-    server_upi = extract_server_provider_options(init_resp, "upi") if zero_due else {}
+    server_upi: dict = {}
+    if zero_due:
+        _merge_nonempty_server_options(
+            server_upi,
+            extract_server_provider_options(init_resp, "upi"),
+        )
+        _merge_nonempty_server_options(
+            server_upi,
+            dict(ctx.get("provider_payment_method_options") or {}),
+        )
     if zero_due:
         server_mandate = dict(server_upi.get("mandate_options") or {})
         ctx["provider_payment_method_options"] = dict(server_upi)
@@ -1423,6 +1529,10 @@ def confirm_provider_payment(
         data["setup_intent[usage]"] = setup_intent["usage"]
     payment_method_options = init_resp.get("payment_method_options") or {}
     server_provider_options = extract_server_provider_options(init_resp, provider)
+    _merge_nonempty_server_options(
+        server_provider_options,
+        dict(ctx.get("provider_payment_method_options") or {}),
+    )
     if server_provider_options:
         ctx["provider_payment_method_options"] = dict(server_provider_options)
         if payment_method_id:
@@ -1649,9 +1759,49 @@ def enrich_ideal_redirect(http, redirect_url: str, log: Callable[[str], None]) -
         return {"provider_redirect_url": redirect_url}
 
 
+def _next_action_with_source(data: dict) -> tuple[dict, str]:
+    """Select one action and its owning response object using Stripe's priority."""
+    for key in ("next_action", "action"):
+        action = data.get(key)
+        if isinstance(action, dict) and action:
+            return action, "payment_page"
+
+    elements_session = data.get("elements_session") or {}
+    if isinstance(elements_session, dict):
+        for key in ("action", "next_action"):
+            action = elements_session.get(key)
+            if isinstance(action, dict) and action:
+                return action, "elements_session"
+
+    submission = data.get("submission_attempt") or {}
+    if isinstance(submission, dict):
+        for key in ("next_action", "action"):
+            action = submission.get(key)
+            if isinstance(action, dict) and action:
+                return action, "submission_attempt"
+
+    for intent_key in ("payment_intent", "setup_intent"):
+        intent = data.get(intent_key) or {}
+        if isinstance(intent, dict):
+            action = intent.get("next_action")
+            if isinstance(action, dict) and action:
+                return action, intent_key
+
+    payment_method_object = data.get("payment_method_object") or {}
+    if isinstance(payment_method_object, dict):
+        setup_intent = payment_method_object.get("setup_intent") or {}
+        if isinstance(setup_intent, dict):
+            action = setup_intent.get("next_action")
+            if isinstance(action, dict) and action:
+                return action, "setup_intent"
+
+    action = sc._find_next_action(data)
+    return (action, "unknown") if action else ({}, "")
+
+
 def extract_provider_result(data: dict, provider: str) -> dict[str, Any]:
     provider = provider.lower()
-    na = sc._find_next_action(data)
+    na, next_action_intent_kind = _next_action_with_source(data)
     redirect = (na.get("redirect_to_url") or {}).get("url") or ""
     if not redirect:
         redirect = sc.extract_redirect_url(data)
@@ -1659,6 +1809,7 @@ def extract_provider_result(data: dict, provider: str) -> dict[str, Any]:
         "provider": provider,
         "provider_redirect_url": redirect,
         "next_action_type": na.get("type") or "",
+        "next_action_intent_kind": next_action_intent_kind,
     }
     if provider == "pix":
         qr = na.get("pix_display_qr_code") or {}
@@ -1744,26 +1895,27 @@ def stripe_to_provider(
     pk = str(stage1.get("publishable_key") or "") or sc.verify_pk(http, session_id, log)
     init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
     stash_setup_intent_context(ctx, init_data)
+    merge_server_provider_options(ctx, provider, init_data, reset=True)
     methods = ctx.get("payment_method_types") or []
     if provider not in methods:
         raise RuntimeError(f"当前 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
-    sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+    elements_data = sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+    merge_server_provider_options(ctx, provider, elements_data)
     processor = str(stage1.get("processor_entity") or "") or sc._entity_from_return_url(ctx.get("return_url") or init_data.get("return_url") or "") or "openai_llc"
 
-    def sync_billing_context() -> None:
+    def sync_billing_context() -> dict:
         ctx["billing"] = billing
-        sc.update_tax_region(http, session_id, pk, version, ctx, billing, profile, log)
+        tax_data = sc.update_tax_region(http, session_id, pk, version, ctx, billing, profile, log)
+        merge_server_provider_options(ctx, provider, tax_data)
         sc.snapshot_billing(chatgpt_http, access_token, session_id, processor, billing, log)
+        return tax_data
 
     # The Checkout and ChatGPT snapshot must already carry the local billing
     # address before promotion eligibility is recalculated.
     sync_billing_context()
     if apply_promo_callback and not late_promo:
         original_checkout_amount = ctx.get("checkout_amount")
-        try:
-            already_zero = int(str(original_checkout_amount or 0)) == 0
-        except (TypeError, ValueError):
-            already_zero = str(original_checkout_amount).strip() in {"0", "0.0", "0.00"}
+        already_zero = amount_is_zero(original_checkout_amount)
         if already_zero:
             log("[promo] Checkout 创建时金额已为 0，保留 Stage1 原生 mandate 配置")
             ctx["original_checkout_amount"] = original_checkout_amount
@@ -1773,10 +1925,12 @@ def stripe_to_provider(
             init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
             ctx["original_checkout_amount"] = original_checkout_amount
             stash_setup_intent_context(ctx, init_data)
+            merge_server_provider_options(ctx, provider, init_data, reset=True)
             methods = ctx.get("payment_method_types") or []
             if provider not in methods:
                 raise RuntimeError(f"应用优惠后 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
-            sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+            elements_data = sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+            merge_server_provider_options(ctx, provider, elements_data)
             sync_billing_context()
     if provider == "pix" and require_zero_due and not late_promo:
         original_checkout_amount = ctx.get("original_checkout_amount")
@@ -1795,36 +1949,23 @@ def stripe_to_provider(
         ctx["original_checkout_amount"] = checkout_amount
     promo_applied = None
 
-    def upi_hosted_fallback(reason: str) -> dict[str, Any]:
-        return {
-            "provider": "upi",
-            "provider_redirect_url": f"https://pay.openai.com/c/pay/{session_id}",
-            "payment_method_types": ctx.get("payment_method_types") or methods,
-            "processor_entity": processor,
-            "stripe_publishable_key": pk,
-            "checkout_amount": checkout_amount,
-            "checkout_currency": str(ctx.get("currency") or "").upper(),
-            "promo_requested": require_zero_due,
-            "promo_applied": promo_applied,
-            "upi_mandate_available": False,
-            "upi_mandate_source": "missing",
-            "fallback_reason": reason,
-        }
-
     if require_zero_due:
         if late_promo:
+            if not _amount_is_positive(checkout_amount):
+                raise RuntimeError("late_promo_requires_positive_initial_amount")
             log(f"[promo] 本轮延后到 PaymentMethod 挂载后应用优惠，当前 amount={checkout_amount}")
         else:
             if checkout_amount is None:
                 raise RuntimeError("优惠金额校验失败：Stripe 未返回今日应付金额")
-            try:
-                promo_applied = int(str(checkout_amount)) == 0
-            except ValueError:
-                promo_applied = str(checkout_amount).strip() in {"0", "0.0", "0.00"}
+            promo_applied = amount_is_zero(checkout_amount)
             if not promo_applied:
                 raise RuntimeError(f"Plus 首月免费优惠未生效：Stripe 今日应付 amount={checkout_amount}")
             if provider == "upi":
-                server_upi = extract_server_provider_options(init_data if isinstance(init_data, dict) else {}, "upi")
+                server_upi = merge_server_provider_options(
+                    ctx,
+                    "upi",
+                    init_data if isinstance(init_data, dict) else {},
+                )
                 server_mandate = dict((server_upi.get("mandate_options") or {}))
                 ctx["server_upi_mandate_present"] = bool(server_mandate)
                 ctx["local_mandate_synthesized"] = False
@@ -1838,9 +1979,12 @@ def stripe_to_provider(
                     ctx["provider_payment_method_options"] = dict(server_upi)
                     log(
                         "[upi] Checkout 已归零，但 OpenAI/Stripe 未返回 UPI AutoPay mandate；"
-                        "跳过 PaymentMethod、confirm 和 approval，返回官方 Hosted Checkout"
+                        "当前周期无法安全提交 0 元 confirm"
                     )
-                    return upi_hosted_fallback("zero_due_without_server_upi_mandate")
+                    raise RuntimeError(
+                        "0 元 UPI Checkout 缺少服务端 AutoPay mandate；"
+                        "当前 Checkout 无法创建 UPI AutoPay"
+                    )
             if provider == "pix":
                 log("[promo] 第 5/7 步：返回 BR 主链路并校验通过，Stripe 今日应付 amount=0")
             else:
@@ -1853,7 +1997,14 @@ def stripe_to_provider(
         else:
             log("[upi] 正在创建独立 UPI PaymentMethod")
     payment_method_id = ""
-    if provider in {"pix", "upi"} and local_method_strategy == "standalone":
+    create_standalone_method = (
+        provider in {"pix", "upi"}
+        and (
+            local_method_strategy == "standalone"
+            or (provider == "upi" and late_promo)
+        )
+    )
+    if create_standalone_method:
         payment_method_id = create_provider_payment_method(
             http,
             pk,
@@ -1974,80 +2125,203 @@ def stripe_to_provider(
     if not provider_has_action(out):
         sub = confirm.get("submission_attempt") or {}
         if sub.get("state") == "requires_approval" and approve_callback:
+            approval_needed = True
+            zero_reconfirm_before_approval = False
             if late_promo and apply_promo_callback:
                 log(f"[{provider}] PaymentMethod 已挂载，开始延后应用优惠")
+                original_checkout_amount = ctx.get("original_checkout_amount") or checkout_amount
                 apply_promo_callback(processor)
-                promo_init, _promo_version, promo_ctx = sc.init_checkout(http, session_id, pk, profile, log)
-                promo_ctx["billing"] = billing
-                sc.update_tax_region(
-                    http, session_id, pk, _promo_version, promo_ctx, billing, profile, log,
+                promo_init, promo_version, promo_ctx = sc.init_checkout(
+                    http, session_id, pk, profile, log,
                 )
+                promo_ctx["original_checkout_amount"] = original_checkout_amount
+                promo_ctx["billing"] = billing
+                if payment_method_id:
+                    promo_ctx["payment_method_id"] = payment_method_id
+                stash_setup_intent_context(promo_ctx, promo_init)
+                merge_server_provider_options(
+                    promo_ctx,
+                    provider,
+                    promo_init if isinstance(promo_init, dict) else {},
+                    reset=True,
+                )
+                promo_methods = promo_ctx.get("payment_method_types") or []
+                if provider not in promo_methods:
+                    log(
+                        f"[{provider}] 归零后可选方式不再列出 {provider}；"
+                        "继续处理归零前已挂载的 PaymentMethod"
+                    )
+                promo_elements = sc.fetch_elements_session(
+                    http,
+                    pk,
+                    session_id,
+                    promo_ctx,
+                    promo_version,
+                    profile,
+                    log,
+                )
+                merge_server_provider_options(promo_ctx, provider, promo_elements)
+                promo_tax = sc.update_tax_region(
+                    http, session_id, pk, promo_version, promo_ctx, billing, profile, log,
+                )
+                merge_server_provider_options(promo_ctx, provider, promo_tax)
                 sc.snapshot_billing(
                     chatgpt_http, access_token, session_id, processor, billing, log,
                 )
                 promo_amount = promo_ctx.get("checkout_amount")
-                try:
-                    promo_applied = int(str(promo_amount or 0)) == 0
-                except (TypeError, ValueError):
-                    promo_applied = str(promo_amount).strip() in {"0", "0.0", "0.00"}
+                promo_applied = amount_is_zero(promo_amount)
                 if not promo_applied:
                     raise RuntimeError(f"延后应用优惠未归零：Stripe 今日应付 amount={promo_amount}")
                 checkout_amount = promo_amount
+                init_data = promo_init
+                version = promo_version
+                ctx = promo_ctx
+                methods = promo_methods or methods
                 if provider == "upi":
-                    server_upi = extract_server_provider_options(promo_init if isinstance(promo_init, dict) else {}, "upi")
+                    server_upi = merge_server_provider_options(
+                        ctx,
+                        "upi",
+                        promo_init if isinstance(promo_init, dict) else {},
+                    )
                     server_mandate = dict(server_upi.get("mandate_options") or {})
-                    ctx["provider_payment_method_options"] = dict(server_upi)
                     ctx["server_upi_mandate_present"] = bool(server_mandate)
                     ctx["local_mandate_synthesized"] = False
                     if not server_mandate:
                         log(
                             "[upi] 延后优惠归零后仍缺少服务端 AutoPay mandate；"
-                            "跳过 approval，返回官方 Hosted Checkout"
+                            "继续使用归零前已挂载的 PaymentMethod 执行 approval/poll"
                         )
-                        return upi_hosted_fallback("zero_due_without_server_upi_mandate")
                 log(f"[{provider}] 延后优惠金额校验通过：Stripe 今日应付 amount=0")
-            approve_callback(processor)
+                if provider == "upi":
+                    log("[upi] approval 前使用原 PaymentMethod 重建零金额 submission")
+                    zero_confirm = recover_upi_via_payment_page(
+                        http,
+                        pk,
+                        session_id,
+                        init_data if isinstance(init_data, dict) else {},
+                        ctx,
+                        billing,
+                        profile,
+                        version,
+                        log,
+                        approve_callback=None,
+                        processor=processor,
+                    )
+                    if not zero_confirm:
+                        raise RuntimeError("upi_zero_reconfirm_failed_before_approval")
+                    confirm = zero_confirm
+                    stash_setup_intent_context(ctx, confirm)
+                    out = extract_provider_result(confirm, provider)
+                    zero_reconfirm_before_approval = True
+                    zero_submission_state = str(
+                        ((confirm.get("submission_attempt") or {}).get("state") or "")
+                    )
+                    if provider_has_action(out):
+                        approval_needed = False
+                        log("[upi] 零金额重确认已直接产出 UPI QR/跳转")
+                    elif zero_submission_state == "requires_approval":
+                        approval_needed = True
+                        log("[upi] 零金额 submission 已就绪，开始 approval")
+                    elif zero_submission_state in {"processing", "succeeded"}:
+                        approval_needed = False
+                        log(
+                            "[upi] 零金额 submission 无需 approval，"
+                            f"当前 state={zero_submission_state}"
+                        )
+                    else:
+                        detail = provider_failure_detail(confirm)
+                        raise RuntimeError(
+                            "upi_zero_reconfirm_failed_before_approval:"
+                            f"{detail or zero_submission_state or 'missing_submission_state'}"
+                        )
+            if approval_needed:
+                approve_callback(processor)
             # Zero-only recovery (fast):
-            # 1) poll once for QR
+            # 1) poll the current submission once for QR
             # 2) re-init for last_setup_error.pm
-            # 3) one Payment Page re-confirm cycle; stop on setup_attempt_failed
-            confirm = sc.poll_payment_page_after_approve(
-                http,
-                pk,
-                session_id,
-                log,
-                ctx=ctx,
-                max_attempts=4,
-            )
-            stash_setup_intent_context(ctx, confirm)
-            out = extract_provider_result(confirm, provider)
+            # 3) only legacy paths get one post-approval Payment Page re-confirm
+            if not provider_has_action(out):
+                confirm = sc.poll_payment_page_after_approve(
+                    http,
+                    pk,
+                    session_id,
+                    log,
+                    ctx=ctx,
+                    max_attempts=4,
+                )
+                stash_setup_intent_context(ctx, confirm)
+                out = extract_provider_result(confirm, provider)
             if provider == "upi" and not provider_has_action(out):
                 try:
-                    reinit_data, _reinit_version, reinit_ctx = sc.init_checkout(
+                    previous_ctx = ctx
+                    reinit_data, reinit_version, reinit_ctx = sc.init_checkout(
                         http, session_id, pk, profile, log,
                     )
-                    stash_setup_intent_context(ctx, reinit_data)
-                    reinit_out = extract_provider_result(reinit_data, provider)
+                    reinit_ctx["billing"] = billing
+                    reinit_ctx["original_checkout_amount"] = previous_ctx.get(
+                        "original_checkout_amount",
+                        checkout_amount,
+                    )
+                    if payment_method_id:
+                        reinit_ctx["payment_method_id"] = payment_method_id
+                    stash_setup_intent_context(reinit_ctx, reinit_data)
+                    merge_server_provider_options(
+                        reinit_ctx,
+                        provider,
+                        reinit_data if isinstance(reinit_data, dict) else {},
+                        reset=True,
+                    )
+                    reinit_elements = sc.fetch_elements_session(
+                        http,
+                        pk,
+                        session_id,
+                        reinit_ctx,
+                        reinit_version,
+                        profile,
+                        log,
+                    )
+                    merge_server_provider_options(reinit_ctx, provider, reinit_elements)
+                    reinit_tax = sc.update_tax_region(
+                        http,
+                        session_id,
+                        pk,
+                        reinit_version,
+                        reinit_ctx,
+                        billing,
+                        profile,
+                        log,
+                    )
+                    reinit_options = merge_server_provider_options(
+                        reinit_ctx,
+                        provider,
+                        reinit_tax,
+                    )
+                    if provider == "upi":
+                        reinit_ctx["server_upi_mandate_present"] = bool(
+                            reinit_options.get("mandate_options")
+                        )
+                        reinit_ctx["local_mandate_synthesized"] = False
+
+                    # Re-init is a new transaction snapshot. Carry durable ids
+                    # through ctx, but never inherit an old action or error.
+                    confirm = dict(reinit_data)
+                    init_data = reinit_data
+                    version = reinit_version
+                    ctx = reinit_ctx
+                    checkout_amount = reinit_ctx.get("checkout_amount")
+                    methods = reinit_ctx.get("payment_method_types") or methods
+                    recovered_pm = extract_payment_method_id(reinit_data, confirm)
+                    if recovered_pm:
+                        payment_method_id = recovered_pm
+                        ctx["payment_method_id"] = recovered_pm
+                        log(f"[upi] re-init 回填 payment_method={recovered_pm}")
+                    stash_setup_intent_context(ctx, confirm)
+                    reinit_out = extract_provider_result(confirm, provider)
                     if provider_has_action(reinit_out):
-                        confirm = reinit_data
                         out = reinit_out
                         log("[upi] approval 后 re-init 已提取 UPI QR/跳转")
                     else:
-                        confirm = dict(confirm)
-                        if isinstance(reinit_data.get("setup_intent"), dict):
-                            confirm["setup_intent"] = reinit_data["setup_intent"]
-                        if isinstance(reinit_data.get("payment_intent"), dict):
-                            confirm["payment_intent"] = reinit_data["payment_intent"]
-                        if reinit_data.get("next_action"):
-                            confirm["next_action"] = reinit_data["next_action"]
-                        ctx["checkout_amount"] = reinit_ctx.get(
-                            "checkout_amount", ctx.get("checkout_amount")
-                        )
-                        recovered_pm = extract_payment_method_id(reinit_data, confirm)
-                        if recovered_pm:
-                            payment_method_id = recovered_pm
-                            ctx["payment_method_id"] = recovered_pm
-                            log(f"[upi] re-init 回填 payment_method={recovered_pm}")
+                        out = reinit_out
                 except Exception as exc:  # noqa: BLE001
                     log(f"[upi] approval 后 re-init 提示：{type(exc).__name__}: {exc}")
             if not payment_method_id:
@@ -2065,37 +2339,28 @@ def stripe_to_provider(
             failure_detail = provider_failure_detail(confirm)
             if failure_detail:
                 log(f"[{provider}] approval 后失败详情：{failure_detail}")
-            if provider == "upi" and not provider_has_action(out):
-                # Skip long recover when first approve already setup-failed without
-                # server mandate — client re-confirm almost never yields QR.
-                server_mandate = bool(ctx.get("server_upi_mandate_present"))
-                if (
-                    not server_mandate
-                    and decline
-                    and str(decline.get("code") or "") == "setup_attempt_failed"
-                ):
-                    log(
-                        "[upi] 0 元 setup_attempt_failed 且无服务端 mandate，"
-                        "跳过冗长补交以加速换号"
-                    )
-                else:
-                    log("[upi] 改走 Payment Page 补交（Checkout SetupIntent 不可直连 confirm）")
-                    recovered = recover_upi_via_payment_page(
-                        http,
-                        pk,
-                        session_id,
-                        init_data if isinstance(init_data, dict) else {},
-                        ctx,
-                        billing,
-                        profile,
-                        version,
-                        log,
-                        approve_callback=approve_callback,
-                        processor=processor,
-                    )
-                    if recovered:
-                        confirm = recovered
-                        out = extract_provider_result(confirm, provider)
+            if (
+                provider == "upi"
+                and not provider_has_action(out)
+                and not zero_reconfirm_before_approval
+            ):
+                log("[upi] 改走 Payment Page 补交（Checkout SetupIntent 不可直连 confirm）")
+                recovered = recover_upi_via_payment_page(
+                    http,
+                    pk,
+                    session_id,
+                    init_data if isinstance(init_data, dict) else {},
+                    ctx,
+                    billing,
+                    profile,
+                    version,
+                    log,
+                    approve_callback=approve_callback,
+                    processor=processor,
+                )
+                if recovered:
+                    confirm = recovered
+                    out = extract_provider_result(confirm, provider)
             elif provider != "upi":
                 try_setup_intent_recover("approval 后")
             if decline and provider == "pix" and not provider_has_action(out):
@@ -2123,6 +2388,27 @@ def stripe_to_provider(
                     out = extract_provider_result(confirm, provider)
             else:
                 try_setup_intent_recover("confirm 后")
+    terminal_failure = provider_terminal_failure_detail(confirm)
+    if terminal_failure:
+        raise RuntimeError(f"{provider} 支付通道拒绝：{terminal_failure}")
+    if provider == "upi" and require_zero_due:
+        if promo_applied is not True:
+            raise RuntimeError(
+                "UPI 优惠链路未完成归零校验："
+                "late_promo_requires_approval_before_promo"
+            )
+        latest_amount = ctx.get("checkout_amount")
+        if not amount_is_zero(latest_amount):
+            raise RuntimeError("upi_latest_checkout_amount_not_zero")
+        checkout_amount = latest_amount
+        if (
+            provider_has_action(out)
+            and str(out.get("next_action_intent_kind") or "") != "setup_intent"
+        ):
+            raise RuntimeError(
+                "upi_zero_due_action_not_setup_intent:"
+                f"{out.get('next_action_intent_kind') or 'unknown'}"
+            )
     out.update({
         "payment_method_types": ctx.get("payment_method_types") or methods,
         "processor_entity": processor,
@@ -2148,19 +2434,10 @@ def stripe_to_provider(
         decline = payment_decline(confirm)
         failure_detail = provider_failure_detail(confirm)
         if provider == "upi" and require_zero_due and promo_applied:
-            log(
-                "[upi] 服务端 AutoPay mandate 路径仍未产出 UPI QR/跳转；"
-                "返回官方 0 元 Checkout fallback"
+            raise RuntimeError(
+                "UPI 归零后的 confirm/approval/poll 未产出二维码或跳转："
+                f"{failure_detail or 'zero_due_without_upi_result'}"
             )
-            out.update({
-                "provider": provider,
-                "provider_redirect_url": f"https://pay.openai.com/c/pay/{session_id}",
-                "upi_mandate_available": bool(
-                    (ctx.get("provider_payment_method_options") or {}).get("mandate_options")
-                ),
-                "fallback_reason": failure_detail or "zero_due_without_upi_result",
-            })
-            return out
         if decline or failure_detail:
             raise RuntimeError(
                 f"{provider} 支付通道拒绝："

@@ -21,7 +21,13 @@ from flask import Flask, jsonify, request, send_from_directory
 from curl_cffi import requests
 
 import stripe_checkout as sc
-from provider_checkout import PROVIDER_DEFAULTS, default_billing, stripe_to_provider
+from provider_checkout import (
+    PROVIDER_DEFAULTS,
+    UPI_NEXT_ACTION_TYPE,
+    amount_is_zero,
+    default_billing,
+    stripe_to_provider,
+)
 from proxy_pool import OPTIMIZER, PROVIDER_PROXY_COUNTRIES, ProxyLeaseRegistry, ProxyProbe
 from sentinel_token import SentinelTokenProvider as BaseSentinel
 
@@ -33,15 +39,6 @@ LEGACY_SERVICE_BASE = str(os.getenv("PAY153_LEGACY_BASE", "")).rstrip("/")
 CONFIGURED_PROXY_GATEWAY = str(os.getenv("PAY153_PROXY_GATEWAY", "")).strip()
 app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
 app.config["JSON_AS_ASCII"] = False
-
-STRIPE_CHECKOUT_FRAGMENT = (
-    "#fidnandhYHdWcXxpYCc%2FJ2FgY2RwaXEnKSdpamZkaWAnPyd%2FbScpJ3ZwZ3Zmd2x1cWxqa1Brb"
-    "HRwYGtgdnZAa2RnaWBhJz9jZGl2YCknYnBkZmRoamlgU2R3bGRrcSc%2FJ2Zqa3F3amknKSdkdWxO"
-    "YHwnPyd1blppbHNgWjA0TUp3VnJGM200a31Cakw2aVFEYldvXFN3fzFhUDZjU0pkZ3xGZk5XNnVnQ"
-    "E9icEZTRGl0Rn1hfUZQc2pXbTRdUnJXZGZTbGpzUDZuSU5zdW5vbTJMdG5SNTVsXVR2b2o2aycpJ2"
-    "N3amhWYHdzYHcnP3F3cGApJ2dkZm5id2pwa2FGamlqdyc%2FJyZjY2NjY2MnKSdpZHxqcHFRfHVgJ"
-    "z8ndmxrYmlgWmxxYGgnKSdga2RnaWBVaWRmYG1qaWFgd3YnP3F3cGB4JSUl"
-)
 
 PLANS = {
     "plus": "chatgptplusplan",
@@ -170,6 +167,35 @@ def approval_session_candidates(
         candidates.append((exit_proxy, provider_http, "IN 支付 Session"))
     candidates.append((checkout_proxy, checkout_http, "Checkout 创建 Session"))
     return candidates
+
+
+def validate_provider_result(provider: str, result: dict) -> None:
+    """Reject local-payment placeholders before a job can be marked done."""
+    if str(provider or "").lower() != "upi":
+        return
+    if result.get("fallback_reason"):
+        raise RuntimeError("upi_invalid_fallback_result")
+    if result.get("promo_requested"):
+        if result.get("promo_applied") is not True:
+            raise RuntimeError("upi_promo_not_applied")
+        if not amount_is_zero(result.get("checkout_amount")):
+            raise RuntimeError("upi_checkout_amount_not_zero")
+    if not any(
+        result.get(key)
+        for key in (
+            "provider_redirect_url",
+            "qr_image_png",
+            "qr_image_svg",
+            "qr_data",
+        )
+    ):
+        raise RuntimeError("upi_no_action_after_confirm")
+    if result.get("next_action_type") != UPI_NEXT_ACTION_TYPE:
+        raise RuntimeError("upi_invalid_next_action_type")
+    redirect = str(result.get("provider_redirect_url") or "")
+    redirect_host = str(urlsplit(redirect).hostname or "").lower() if redirect else ""
+    if redirect_host in {"pay.openai.com", "checkout.stripe.com"}:
+        raise RuntimeError("upi_checkout_url_is_not_action")
 
 
 def _decode_jwt(token: str) -> dict:
@@ -575,7 +601,8 @@ def create_checkout(token: str, payload: dict, proxy: str, device_id: str, did: 
         match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", text)
         sid = match.group(0) if match else ""
     data["checkout_session_id"] = sid
-    data["checkout_url"] = url or (f"https://pay.openai.com/c/pay/{sid}{STRIPE_CHECKOUT_FRAGMENT}" if sid else "")
+    # A session id plus a copied fragment is not a signed Hosted Checkout URL.
+    data["checkout_url"] = url
     return {"data": data, "http": http}
 
 
@@ -648,6 +675,15 @@ def promo_campaign_from_payload(payload: Any) -> str:
 
     walk(payload)
     return candidates[0] if candidates else ""
+
+
+def upi_promo_is_explicitly_unavailable(payload: Any) -> bool:
+    """Return true only when the server denies the marker and no campaign exists."""
+    return (
+        isinstance(payload, dict)
+        and payload.get("one_click_trial_eligible") is False
+        and not promo_campaign_from_payload(payload)
+    )
 
 
 def proxy_geo(proxy: str) -> dict[str, str]:
@@ -916,6 +952,34 @@ class JobStore:
     def _record_success(self, job_id: str, result: dict):
         """Persist successful link results so batch runs survive restarts."""
         try:
+            if result.get("fallback_reason"):
+                return
+            link_type = str(result.get("link_type") or "").lower()
+            validate_provider_result(link_type, result)
+            action_kind = ""
+            action_value = ""
+            if link_type == "upi":
+                for key in (
+                    "provider_redirect_url",
+                    "qr_data",
+                    "qr_image_png",
+                    "qr_image_svg",
+                ):
+                    value = str(result.get(key) or "")
+                    if value:
+                        action_kind = key
+                        action_value = value
+                        break
+            else:
+                action_kind = "url"
+                action_value = str(
+                    result.get("provider_redirect_url")
+                    or result.get("paypal_link")
+                    or result.get("url")
+                    or result.get("link")
+                    or result.get("checkout_url")
+                    or ""
+                )
             record = {
                 "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "job_id": job_id,
@@ -929,7 +993,10 @@ class JobStore:
                 "link_type": result.get("link_type") or "",
                 "checkout_amount": result.get("checkout_amount"),
                 "currency": result.get("checkout_currency") or result.get("currency") or "",
-                "url": result.get("provider_redirect_url") or result.get("paypal_link") or result.get("url") or result.get("link") or result.get("checkout_url") or "",
+                "promo_applied": result.get("promo_applied"),
+                "action_kind": action_kind,
+                "action_value": action_value,
+                "url": action_value,
             }
             path = ROOT / "data" / "success_links.jsonl"
             with self.file_lock:
@@ -1213,9 +1280,9 @@ class JobStore:
                     strategy_cycle = ("standalone", "late_promo", "inline")
                     current["promo_on_create"] = False
                 else:
-                    # Create the zero-due UPI Checkout natively on the fixed IN
-                    # Session. Continue only when init exposes the merchant-owned
-                    # AutoPay mandate; otherwise return the Hosted fallback.
+                    # A zero-due UPI SetupIntent must be configured by the
+                    # merchant when Checkout is created. Eligibility is checked
+                    # before this native-promo strategy is allowed to run.
                     strategy_cycle = ("hosted_minimal",)
                     current["promo_on_create"] = True
                     current["upi_create_on_promo_entry"] = False
@@ -1263,7 +1330,7 @@ class JobStore:
             lowered = last_error.lower()
             non_retryable = any(marker in lowered for marker in (
                 "access token", "token_invalidated", "token_expired", "token_revoked", "jwt expired",
-                "计划类型", "提取方式", "任务已停止",
+                "计划类型", "提取方式", "任务已停止", "upi_promo_not_eligible",
             ))
             if not non_retryable:
                 OPTIMIZER.report(pair, success=False, error=last_error)
@@ -1415,6 +1482,8 @@ class JobStore:
                     options["promo_campaign"] = detected_campaign
                     options["promo_campaign_verified"] = True
                     self.log(job_id, f"优惠预检已匹配账号活动：{detected_campaign}")
+                if provider == "upi" and upi_promo_is_explicitly_unavailable(preflight):
+                    raise RuntimeError("upi_promo_not_eligible")
                 self.ensure_not_cancelled(job_id)
 
             self.update(job_id, percent=18, text="生成 Sentinel 校验")
@@ -1471,6 +1540,12 @@ class JobStore:
                 options["promo_campaign"] = stage1_campaign
                 options["promo_campaign_verified"] = True
                 self.log(job_id, f"Checkout 已返回活动标识：{stage1_campaign}")
+            if (
+                provider == "upi"
+                and promo_requested
+                and upi_promo_is_explicitly_unavailable(checkout_data)
+            ):
+                raise RuntimeError("upi_promo_not_eligible")
             provider_chatgpt_http = chatgpt_http
             promo_chatgpt_http = chatgpt_http
             if provider in {"paypal", "upi", "ideal"}:
@@ -1776,6 +1851,7 @@ class JobStore:
                         self.log(job_id, f"Checkout approval exception（{label}），交 Stripe poll 确认")
                         break
                 self.ensure_not_cancelled(job_id)
+                return last_payload
 
             def apply_promo_cb(processor: str):
                 self.ensure_not_cancelled(job_id)
@@ -1825,6 +1901,7 @@ class JobStore:
                 local_method_strategy=options.get("local_method_strategy") or "standalone",
                 log=provider_log,
             )
+            validate_provider_result(provider, provider_result)
             self.ensure_not_cancelled(job_id)
             self.update(job_id, percent=98, text="结果已生成，正在整理页面")
             result.update(provider_result)
@@ -1836,14 +1913,7 @@ class JobStore:
                 result["checkout_currency"] = result["currency"]
             if provider == "upi":
                 mandate_source = str(provider_result.get("upi_mandate_source") or "")
-                if provider_result.get("fallback_reason"):
-                    self.log(
-                        job_id,
-                        f"UPI 结果：官方 Checkout fallback，"
-                        f"mandate={mandate_source or 'n/a'}，"
-                        f"原因={provider_result.get('fallback_reason')}",
-                    )
-                elif mandate_source:
+                if mandate_source:
                     self.log(
                         job_id,
                         f"UPI AutoPay mandate 来源={mandate_source}，"
@@ -1863,6 +1933,11 @@ class JobStore:
                 error_text = "Access Token 已失效，请重新登录 ChatGPT 获取新的 Session JSON 或 AT。"
             elif "token_expired" in lowered or "jwt expired" in lowered:
                 error_text = "Access Token 已过期，请重新登录 ChatGPT 获取新的 Session JSON 或 AT。"
+            elif "upi_promo_not_eligible" in lowered:
+                error_text = (
+                    "当前账号未返回可用的 Plus 优惠活动，不能创建零金额 UPI mandate。"
+                    "（upi_promo_not_eligible）"
+                )
             elif "not_eligible" in lowered:
                 error_text = "当前账号未开放所选套餐或支付通道。"
             elif "cannot combine currencies" in lowered:

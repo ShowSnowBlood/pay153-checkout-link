@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>PAY.153 · 多通道提链控制台</title>
-  <meta name="description" content="Hosted、PayPal、iDEAL、UPI、PIX、Team 与 Codex 空间提链工作台">
+  <meta name="description" content="Hosted、PayPal、iDEAL、UPI、PIX、KakaoPay、Team 与 Codex 空间提链工作台">
   <link rel="stylesheet" href="/static/styles.css?v=20260716-neo02">
 </head>
 <body>
@@ -27,13 +27,13 @@
       <div class="hero-copy">
         <div class="eyebrow"><span>01</span> MULTI-RAIL CHECKOUT</div>
         <h1>把支付路径，<em>交给一张控制台。</em></h1>
-        <p>输入会话、选择通道、交给任务队列。Hosted、PayPal、iDEAL、UPI、PIX 与空间方案统一在一个流程内完成。</p>
+        <p>输入会话、选择通道、交给任务队列。Hosted、PayPal、iDEAL、UPI、PIX、KakaoPay 与空间方案统一在一个流程内完成。</p>
         <div class="hero-chips">
-          <span>PayPal</span><span>iDEAL</span><span>UPI QR</span><span>PIX</span><span>Team</span><span>Codex</span>
+          <span>PayPal</span><span>iDEAL</span><span>UPI QR</span><span>PIX</span><span>KakaoPay</span><span>Team</span><span>Codex</span>
         </div>
       </div>
       <div class="hero-board" aria-label="服务能力">
-        <div><small>ROUTES</small><strong>05</strong><span>支付通道</span></div>
+        <div><small>ROUTES</small><strong>06</strong><span>支付通道</span></div>
         <div><small>PUBLIC RATE</small><strong>20</strong><span>任务 / 分钟</span></div>
         <div><small>TOKEN MODE</small><strong>RAM</strong><span>仅任务内存</span></div>
       </div>
@@ -71,6 +71,7 @@
             <label class="rail"><input type="radio" name="link_type" value="ideal"><span class="rail-icon">iD</span><span><b>iDEAL</b><small>荷兰银行支付</small></span></label>
             <label class="rail"><input type="radio" name="link_type" value="upi"><span class="rail-icon">₹</span><span><b>UPI</b><small>印度二维码</small></span></label>
             <label class="rail"><input type="radio" name="link_type" value="pix"><span class="rail-icon">◇</span><span><b>PIX</b><small>巴西即时支付</small></span></label>
+            <label class="rail"><input type="radio" name="link_type" value="kakao"><span class="rail-icon">K</span><span><b>KakaoPay</b><small>韩国 0 KRW 提链</small></span></label>
           </div>
         </fieldset>
 
@@ -81,10 +82,11 @@
             <option value="IN">IN · 印度</option><option value="BR">BR · 巴西</option>
             <option value="GB">GB · 英国</option><option value="JP">JP · 日本</option>
             <option value="AU">AU · 澳大利亚</option><option value="CA">CA · 加拿大</option>
+            <option value="KR">KR · 韩国</option>
           </select></label>
           <label class="field"><span>币种</span><select id="currency">
             <option>USD</option><option>EUR</option><option>INR</option><option>BRL</option>
-            <option>GBP</option><option>JPY</option><option>AUD</option><option>CAD</option>
+            <option>GBP</option><option>JPY</option><option>AUD</option><option>CAD</option><option>KRW</option>
           </select></label>
         </div>
         <p id="regionAutoHint" class="region-auto-hint" hidden>PayPal 的国家、地区和币种会根据代理池 2 自动识别。</p>
@@ -139,6 +141,10 @@
           <p class="inline-note">留空税号时，每轮自动生成新的 CPF 或 CNPJ，并同步生成持有人/企业名称、邮箱和巴西地址。填写固定 CNPJ 时会优先查询登记资料。</p>
         </div>
 
+        <div id="kakaoOptions" class="conditional-fields compact-fields" hidden>
+          <p class="inline-note">KakaoPay 仅运行 Plus 首月试用：系统自动使用 KR/KRW Checkout、VN 活动校验和 KR 支付出口，并在最终确认前强制校验 0 KRW。</p>
+        </div>
+
         <div class="form-actions">
           <button id="submitButton" class="primary-button" type="submit"><span>开始提炼</span><i>→</i></button>
           <button id="cancelButton" class="secondary-button" type="button" hidden>停止任务</button>
@@ -185,6 +191,6 @@
   </main>
 
   <footer><span>PAY.153.INK</span><p>任务完成后请及时使用链接；支付提供商生成的二维码通常具有有效期。</p></footer>
-  <script src="/static/app.js?v=20260804-upi-mandate02"></script>
+  <script src="/static/app.js?v=20260806-kakao01"></script>
 </body>
 </html>

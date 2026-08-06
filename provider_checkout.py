@@ -17,6 +17,7 @@ from billing_address_resolver import resolve_public_address
 
 
 PROVIDER_DEFAULTS = {
+    "kakao": {"country": "KR", "currency": "KRW"},
     "paypal": {"country": "US", "currency": "USD"},
     "ideal": {"country": "NL", "currency": "EUR"},
     "upi": {"country": "IN", "currency": "INR"},

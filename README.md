@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>多支付通道提链控制台。</strong><br>
-  Hosted、PayPal、iDEAL、UPI、PIX、Team 与 Codex 空间方案统一任务化处理。
+  Hosted、PayPal、iDEAL、UPI、PIX、KakaoPay、Team 与 Codex 空间方案统一任务化处理。
 </p>
 
 <p align="center">
@@ -27,7 +27,7 @@
 ## 功能概览
 
 - 支持 Plus、Pro、Team 与 Codex 低价空间等计划参数。
-- 支持 Hosted 官方长链、PayPal、iDEAL、UPI 和 PIX 支付路径。
+- 支持 Hosted 官方长链、PayPal、iDEAL、UPI、PIX 和 KakaoPay 支付路径。
 - 支持 Access Token 和 Session JSON 自动识别。
 - 双代理池、1–500 条代理、本地保存、代理检测和地区自适应。
 - 按支付地区自动选择币种，并处理不受支持币种的回退逻辑。
@@ -47,6 +47,7 @@
 | iDEAL | 荷兰银行支付路径 |
 | UPI | 印度 UPI 支付与二维码 |
 | PIX | 巴西 PIX 支付与二维码 |
+| KakaoPay | 韩国 KRW 0 元试用链接（KR/VN/KR 粘性代理链） |
 
 ## 项目结构
 
@@ -54,6 +55,8 @@
 pay153-checkout-link/
 ├─ app.py                       # Flask API、任务队列、限流与入口
 ├─ provider_checkout.py         # Checkout、地区、账单与支付提供商流程
+├─ kakao_worker.py              # KakaoPay 隔离 worker（stdin/stdout JSON 协议）
+├─ kakao_checkout.py            # Kakao worker deadline、资格和结果适配器
 ├─ stripe_checkout.py           # Stripe 初始化、金额、确认与跳转处理
 ├─ billing_address_resolver.py  # 在线地图及账单地址解析
 ├─ sentinel_token.py            # Sentinel Token 生成与请求封装
@@ -117,6 +120,7 @@ cp .env.example .env
 | `PAY153_PROXY_PROBE_COUNT` | 每个动态代理池批次生成和探测的候选数，默认 6 |
 | `PAY153_PROXY_PROBE_TIMEOUT` | 单项代理网络探测超时秒数，默认 8 |
 | `PAY153_PROXY_PROBE_TTL` | 固定代理深度探测结果缓存秒数，默认 300 |
+| `PAY153_KAKAO_WORKER_TIMEOUT` | Kakao 单个 worker 操作超时秒数，默认 180 |
 
 ## 代理池
 
@@ -132,7 +136,7 @@ http://host:port:username:password
 ```
 
 `rp.scrapegw.com:6060` 使用 HTTP 协议。直接填写供应商的四段格式时，服务会自动补充
-`-session-__rotate__-lifetime-120`，并按 UPI/iDEAL/PIX 写入 IN/NL/BR 国家参数。
+`-session-__rotate__-lifetime-120`，并按 UPI/iDEAL/PIX/Kakao 写入 IN/NL/BR/KR 国家参数。
 
 动态网关可以把用户名中的 session 值写成 `__rotate__`：
 
@@ -142,7 +146,7 @@ http://username-session-__rotate__-lifetime-120:password@gateway:port
 
 每轮任务会生成一批真实 sticky session，并并发验证出口 IP、国家、OpenAI 后端和 Stripe。
 系统会按支付方式自动插入或改写网关用户名中的国家参数：iDEAL=`country-nl`、UPI=`country-in`、
-PIX=`country-br`，并预留 Kakao=`country-kr`。当前版本尚未实现 Kakao 支付协议。
+PIX=`country-br`、Kakao=`country-kr`。Kakao 提链会在 worker 内部派生 KR（Checkout）/VN（活动）/KR（支付）三段粘性链，并在最终确认前强制校验金额为 0 KRW。
 重复出口会去重，失败候选进入指数冷却。
 选中的入口/支付代理会在完整 Checkout 尝试中复用同一 HTTP Session、Cookie、TLS/UA 指纹和设备标识。
 代理凭据仅应通过网页或环境变量传入。

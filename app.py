@@ -28,6 +28,12 @@ from provider_checkout import (
     default_billing,
     stripe_to_provider,
 )
+from kakao_checkout import (
+    KakaoWorkerError,
+    extract_kakao_link,
+    is_allowed_kakao_qr,
+    is_allowed_kakao_url,
+)
 from proxy_pool import OPTIMIZER, PROVIDER_PROXY_COUNTRIES, ProxyLeaseRegistry, ProxyProbe
 from sentinel_token import SentinelTokenProvider as BaseSentinel
 
@@ -171,7 +177,26 @@ def approval_session_candidates(
 
 def validate_provider_result(provider: str, result: dict) -> None:
     """Reject local-payment placeholders before a job can be marked done."""
-    if str(provider or "").lower() != "upi":
+    provider = str(provider or "").lower()
+    if provider == "kakao":
+        if not amount_is_zero(result.get("checkout_amount", result.get("amount"))):
+            raise RuntimeError("kakao_checkout_amount_not_zero")
+        if str(result.get("checkout_currency") or result.get("currency") or "").upper() != "KRW":
+            raise RuntimeError("kakao_checkout_currency_invalid")
+        redirect = str(result.get("provider_redirect_url") or result.get("link") or "")
+        qr_data = str(result.get("qr_data") or result.get("qr_text") or "")
+        if not redirect or not is_allowed_kakao_url(redirect):
+            raise RuntimeError("kakao_invalid_provider_redirect")
+        if qr_data and not is_allowed_kakao_qr(qr_data):
+            raise RuntimeError("kakao_invalid_qr_data")
+        for key in ("qr_image_png", "qr_image_svg"):
+            image = str(result.get(key) or "")
+            if image and not is_allowed_kakao_qr(image):
+                raise RuntimeError("kakao_invalid_qr_image")
+        if result.get("promo_requested") and result.get("promo_applied") is not True:
+            raise RuntimeError("kakao_promo_not_applied")
+        return
+    if provider != "upi":
         return
     if result.get("fallback_reason"):
         raise RuntimeError("upi_invalid_fallback_result")
@@ -794,7 +819,7 @@ def checkout_proxy_route(options: dict) -> tuple[str, str, bool]:
     target_country = PROVIDER_PROXY_COUNTRIES.get(provider, "") or (
         checkout_country if provider == "hosted" else ""
     )
-    return target_country, target_country, provider in {"hosted", "ideal", "upi", "pix"}
+    return target_country, target_country, provider in {"hosted", "ideal", "upi", "pix", "kakao"}
 
 
 def update_checkout_promo(
@@ -931,7 +956,7 @@ class JobStore:
             "提链尝试", "代理池", "代理校验", "自动设置地区", "计划=",
             "优惠已", "优惠更新", "优惠同步", "金额校验", "今日应付",
             "Checkout 创建", "支付方式已创建", "二维码生成", "链接生成",
-            "提交 Checkout approval", "错误：", "本次未成功",
+            "提交 Checkout approval", "错误：", "本次未成功", "Kakao",
         )) or any(marker in lowered for marker in (
             "init ok", "payment_method:", "manual_approval approve", "checkout/update",
         ))
@@ -1328,9 +1353,12 @@ class JobStore:
                 return
             last_error = str(state.get("error") or "")
             lowered = last_error.lower()
-            non_retryable = any(marker in lowered for marker in (
+            non_retryable = bool(state.get("error_non_retryable")) or any(marker in lowered for marker in (
                 "access token", "token_invalidated", "token_expired", "token_revoked", "jwt expired",
                 "计划类型", "提取方式", "任务已停止", "upi_promo_not_eligible",
+                "kakao_trial_unavailable", "kakao_trial_eligibility_required",
+                "kakao_access_token_rejected", "kakao_nonzero_checkout",
+                "kakao_proxy_country_selector_required", "kakao_proxy_route_unsupported",
             ))
             if not non_retryable:
                 OPTIMIZER.report(pair, success=False, error=last_error)
@@ -1361,6 +1389,59 @@ class JobStore:
                 self.log(job_id, "正在更换代理后重新尝试")
             time.sleep(min(4, 1 + attempt * 0.35))
 
+    def _run_kakao_single(
+        self,
+        job_id: str,
+        options: dict,
+        token: str,
+        meta: dict[str, Any],
+        entry_proxy: str,
+        entry_pool: list[str],
+        entry_probe: ProxyProbe | None,
+    ) -> None:
+        """Run the repository-local Kakao worker and map its strict result."""
+        self.update(job_id, percent=12, text="Kakao 资格预检")
+        self.log(job_id, "Kakao 使用 KR/VN/KR 粘性代理链，先确认 Plus 试用资格")
+        worker_result = extract_kakao_link(
+            token,
+            entry_proxy,
+            route=str(options.get("kakao_route") or "reference"),
+            timeout=float(options.get("kakao_worker_timeout") or 180),
+            cancel_check=lambda: self.cancelled(job_id),
+        )
+        self.ensure_not_cancelled(job_id)
+        self.update(job_id, percent=92, text="Kakao 付款链接已返回，正在校验 0 KRW")
+        result: dict[str, Any] = {
+            "plan": "plus",
+            "link_type": "kakao",
+            "account_email": meta.get("email") or "",
+            "account_id": meta.get("account_id") or "",
+            "country": "KR",
+            "currency": "KRW",
+            "checkout_country": "KR",
+            "checkout_currency": "KRW",
+            "entry_proxy_pool_size": len(entry_pool),
+            "exit_proxy_pool_size": 0,
+            "proxy_mode": "single_chain",
+            "entry_exit_ip": getattr(entry_probe, "exit_ip", ""),
+            "entry_proxy_score": getattr(entry_probe, "score", None),
+            "payment_exit_ip": getattr(entry_probe, "exit_ip", ""),
+            "payment_proxy_score": getattr(entry_probe, "score", None),
+            "network_fingerprint": "chrome136/sticky-session",
+            "promo_requested": True,
+            "promo_applied": True,
+            "promo_campaign_used": "plus-1-month-free",
+            "promotion_eligibility_decided_by": "kakao_worker",
+            "entry_country": "KR",
+            "payment_proxy_country": "KR",
+        }
+        result.update(worker_result)
+        # Do not expose the worker's PaymentMethod id to the browser or to
+        # persisted success records; it is only an internal confirmation id.
+        result.pop("payment_method_id", None)
+        validate_provider_result("kakao", result)
+        self.update(job_id, percent=100, text="Kakao 提链完成", status="done", result=result)
+
     def _run_single(self, job_id: str, options: dict):
         network: AttemptNetworkContext | None = None
         try:
@@ -1376,6 +1457,24 @@ class JobStore:
             entry_proxy = options.get("fixed_entry_proxy") or secrets.choice(entry_pool)
             exit_proxy = entry_proxy if single_chain else (options.get("fixed_exit_proxy") or secrets.choice(exit_pool))
             payment_geo: dict[str, str] = {}
+            if provider == "kakao":
+                self.update(
+                    job_id,
+                    percent=6,
+                    text="解析 Access Token",
+                    error_code="",
+                    error_non_retryable=False,
+                )
+                self._run_kakao_single(
+                    job_id,
+                    options,
+                    token,
+                    meta,
+                    entry_proxy,
+                    entry_pool,
+                    options.get("entry_proxy_probe"),
+                )
+                return
             if provider == "hosted":
                 self.log(job_id, f"代理池共 {len(entry_pool)} 条，本次已自动选择 1 条")
             elif single_chain:
@@ -1924,6 +2023,41 @@ class JobStore:
             self.update(job_id, percent=100, text=done_text, status="done", result=result)
         except InterruptedError as exc:
             self.update(job_id, status="cancelled", percent=100, text=str(exc), error=str(exc))
+        except KakaoWorkerError as exc:
+            if exc.code == "kakao_cancelled":
+                self.update(
+                    job_id,
+                    status="cancelled",
+                    percent=100,
+                    text="任务已停止",
+                    error="任务已停止",
+                    error_code=exc.code,
+                    error_non_retryable=True,
+                )
+            else:
+                stage = f" stage={exc.stage}" if exc.stage else ""
+                status = f" http={exc.http_status}" if exc.http_status else ""
+                self.log(job_id, f"Kakao worker 错误：{exc.code}{stage}{status}")
+                if options.get("retry_wrapper") and exc.transient:
+                    self.update(
+                        job_id,
+                        status="running",
+                        percent=8,
+                        text="Kakao 本次未成功，正在更换代理重试",
+                        error=exc.safe_message[:1200],
+                        error_code=exc.code,
+                        error_non_retryable=False,
+                    )
+                else:
+                    self.update(
+                        job_id,
+                        status="error",
+                        percent=100,
+                        text="Kakao 提链失败",
+                        error=exc.safe_message[:1200],
+                        error_code=exc.code,
+                        error_non_retryable=True,
+                    )
         except Exception as exc:
             raw_error = str(exc)
             error_text = raw_error
@@ -2014,15 +2148,18 @@ def health():
 def config():
     return jsonify({
         "plans": list(PLANS),
-        "link_types": ["hosted", "paypal", "ideal", "upi", "pix"],
+        "link_types": ["hosted", "paypal", "ideal", "upi", "pix", "kakao"],
         "country_currency": COUNTRY_CURRENCY,
         "provider_defaults": PROVIDER_DEFAULTS,
         "proxy_policy": {
             "entry_required": False,
             "exit_required_for": [],
             "managed_gateway": bool(CONFIGURED_PROXY_GATEWAY),
-            "single_chain_for": ["hosted", "ideal", "pix", "upi_without_promo"],
-            "dual_region_for": {"upi_promo": {"entry": "JP", "payment": "IN"}},
+            "single_chain_for": ["hosted", "ideal", "pix", "upi_without_promo", "kakao"],
+            "dual_region_for": {
+                "upi_promo": {"entry": "JP", "payment": "IN"},
+                "kakao_internal": {"checkout": "KR", "promotion": "VN", "provider": "KR"},
+            },
             "max_per_pool": 500,
             "selection": "deep_probe_sticky_session",
             "lease_minutes": LEASES.lease_seconds // 60,
@@ -2051,12 +2188,16 @@ def start_checkout():
     link_type = str(data.get("link_type") or "hosted").lower()
     if plan not in PLANS:
         return jsonify({"error": "计划类型不正确"}), 400
-    if link_type not in {"hosted", "paypal", "ideal", "upi", "pix"}:
+    if link_type not in {"hosted", "paypal", "ideal", "upi", "pix", "kakao"}:
         return jsonify({"error": "提取方式不正确"}), 400
+    if link_type == "kakao" and plan != "plus":
+        return jsonify({"error": "Kakao 提链仅支持 Plus 0 KRW 试用流程"}), 400
+    if link_type == "kakao" and data.get("use_promo") is False:
+        return jsonify({"error": "Kakao 提链必须启用 plus-1-month-free 试用优惠"}), 400
     defaults = PROVIDER_DEFAULTS.get(link_type, {})
     country = str(data.get("country") or defaults.get("country") or "US").upper()
     requested_currency = str(data.get("currency") or defaults.get("currency") or COUNTRY_CURRENCY.get(country, "USD")).upper()
-    if link_type in {"ideal", "upi", "pix"}:
+    if link_type in {"ideal", "upi", "pix", "kakao"}:
         country = str(defaults.get("country") or country).upper()
         requested_currency = str(defaults.get("currency") or COUNTRY_CURRENCY.get(country, "USD")).upper()
     currency, _currency_source = normalize_checkout_currency(country, requested_currency)
@@ -2067,6 +2208,8 @@ def start_checkout():
     if exit_raw is None:
         exit_raw = data.get("exit_proxy") or data.get("payment_proxy") or ""
     promo_requested = plan == "plus" and bool(data.get("use_promo", True))
+    if link_type == "kakao":
+        promo_requested = True
     dual_region_upi = link_type == "upi" and promo_requested
     if link_type == "paypal" and not exit_raw:
         exit_raw = CONFIGURED_PROXY_GATEWAY or entry_raw
@@ -2130,7 +2273,11 @@ def start_checkout():
         "exit_proxies": exit_proxies if (link_type == "paypal" or dual_region_upi) else entry_proxies,
         "use_promo": promo_requested,
         "promo_proxy_country": "JP" if dual_region_upi else "",
-        "promo_campaign": str(data.get("promo_campaign") or "") if plan == "plus" else "",
+        "promo_campaign": (
+            "plus-1-month-free"
+            if link_type == "kakao"
+            else str(data.get("promo_campaign") or "") if plan == "plus" else ""
+        ),
         "promo_code": str(data.get("promo_code") or "") if plan == "team" else "",
         "workspace_name": str(data.get("workspace_name") or "")[:80],
         "workspace_id": str(data.get("workspace_id") or "")[:120],
@@ -2143,6 +2290,7 @@ def start_checkout():
         "pix_auto_kind": str(data.get("pix_auto_kind") or "cpf").lower()
             if str(data.get("pix_auto_kind") or "cpf").lower() in {"mixed", "cpf", "cnpj"} else "cpf",
         "pix_identity": pix_identity,
+        "kakao_route": "reference" if link_type == "kakao" else "",
         "retry_count": retry_count,
     }
     if link_type == "pix" and options["pix_tax_id"] and len(options["pix_tax_id"]) not in {11, 14}:

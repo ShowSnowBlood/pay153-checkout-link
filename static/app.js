@@ -14,9 +14,9 @@ let renderedLogKey = '';
 const providerDefaults = {
   hosted: {country: 'US', currency: 'USD'}, paypal: {country: 'US', currency: 'USD'},
   ideal: {country: 'NL', currency: 'EUR'}, upi: {country: 'IN', currency: 'INR'},
-  pix: {country: 'BR', currency: 'BRL'}
+  pix: {country: 'BR', currency: 'BRL'}, kakao: {country: 'KR', currency: 'KRW'}
 };
-const countryCurrency = {US:'USD',DE:'EUR',FR:'EUR',NL:'EUR',IN:'INR',BR:'BRL',GB:'GBP',JP:'JPY',AU:'AUD',CA:'CAD'};
+const countryCurrency = {US:'USD',DE:'EUR',FR:'EUR',NL:'EUR',IN:'INR',BR:'BRL',GB:'GBP',JP:'JPY',AU:'AUD',CA:'CAD',KR:'KRW'};
 
 function selected(name){ return form.querySelector(`input[name="${name}"]:checked`)?.value || ''; }
 function bindChoices(group, onChange){
@@ -30,18 +30,30 @@ bindChoices($('planGrid'), () => syncFields(false));
 bindChoices($('railGrid'), () => syncFields(true));
 
 function syncFields(applyRailDefault=false){
-  const plan = selected('plan'), rail = selected('link_type');
+  let plan = selected('plan'), rail = selected('link_type');
+  const kakao = rail === 'kakao';
+  if (kakao && plan !== 'plus') {
+    const plusInput = form.querySelector('input[name="plan"][value="plus"]');
+    if (plusInput) {
+      plusInput.checked = true;
+      plan = 'plus';
+      $('planGrid').querySelectorAll('label').forEach(label => label.classList.toggle('active', label.contains(plusInput)));
+    }
+  }
   $('teamFields').hidden = plan !== 'team';
   $('codexFields').hidden = plan !== 'codex_low';
   $('idealOptions').hidden = rail !== 'ideal';
   $('paypalOptions').hidden = rail !== 'paypal';
   $('pixOptions').hidden = rail !== 'pix';
-  $('regionFields').hidden = rail === 'paypal';
+  $('kakaoOptions').hidden = rail !== 'kakao';
+  $('regionFields').hidden = rail === 'paypal' || rail === 'kakao';
   $('regionAutoHint').hidden = rail !== 'paypal';
   $('pixTaxId').required = false;
-  const promoSupported = plan === 'plus';
+  const promoSupported = plan === 'plus' || kakao;
+  $('usePromo').disabled = kakao;
+  if (kakao) $('usePromo').checked = true;
   $('promoLine').style.display = promoSupported ? 'flex' : 'none';
-  $('plusPromoFields').hidden = !promoSupported || !$('usePromo').checked;
+  $('plusPromoFields').hidden = !promoSupported || kakao || !$('usePromo').checked;
   if (applyRailDefault && providerDefaults[rail]) {
     $('country').value = providerDefaults[rail].country;
     $('currency').value = providerDefaults[rail].currency;
@@ -169,11 +181,13 @@ function showResult(result){
         ? '未生效'
         : '打开结账页确认';
   const isUpi = String(result.link_type || '').toLowerCase() === 'upi';
+  const isKakao = String(result.link_type || '').toLowerCase() === 'kakao';
   if (isUpi) {
     const mandateSource = String(result.upi_mandate_source || '').toLowerCase();
     if (mandateSource === 'local') promoText += ' · AutoPay 本地补全';
     else if (mandateSource === 'server') promoText += ' · AutoPay 服务端';
   }
+  if (isKakao) promoText = result.promo_applied === true ? '已生效 · 0 KRW · KakaoPay' : '未生效';
   $('resultPromo').textContent = promoText;
   $('resultSession').textContent = result.checkout_session_id || '—';
   const finalValue = result.qr_data || result.provider_redirect_url || (isUpi ? '' : result.checkout_url) || '';

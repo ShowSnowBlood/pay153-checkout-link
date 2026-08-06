@@ -233,6 +233,23 @@ class KakaoWorkerSourceTests(unittest.TestCase):
             result = kakao_worker._run(json.dumps(request))
         self.assertNotIn("payment_method_id", result)
 
+    def test_proxy_chain_uses_country_scoped_sticky_sessions(self) -> None:
+        import kakao_worker
+
+        seed = (
+            "http://user-country-jp-session-seed123-lifetime-120:secret"
+            "@gateway.test:6060"
+        )
+        checkout, promotion, provider = kakao_worker.kakao_proxy_chain(seed)
+
+        self.assertEqual(checkout, provider)
+        self.assertIn("country-kr-session-seed123kr-lifetime-120", checkout)
+        self.assertIn("country-vn-session-seed123vn-lifetime-120", promotion)
+        self.assertEqual(
+            kakao_worker._proxy_chain_key(checkout),
+            kakao_worker._proxy_chain_key(promotion),
+        )
+
     def test_stripe_pin_changes_proxy_connect_target_and_keeps_sni(self) -> None:
         import kakao_worker
 

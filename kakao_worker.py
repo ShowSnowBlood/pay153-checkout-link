@@ -33,7 +33,7 @@ MAX_CLOCK_SKEW = timedelta(seconds=5)
 HTTP_TIMEOUT = 30.0
 PREFLIGHT_TIMEOUT = 12.0
 REDIRECT_POLL_TIMEOUT = 120.0
-MAX_APPROVE_ATTEMPTS = 1
+MAX_APPROVE_ATTEMPTS = 3
 MAX_REDIRECT_HOPS = 6
 TRIAL_COUPON = "plus-1-month-free"
 STRIPE_VERSION = (
@@ -184,6 +184,9 @@ EMAIL_DOMAINS = ("gmail.com", "naver.com", "daum.net", "kakao.com")
 COUNTRY_SELECTOR_RE = re.compile(
     r"(?i)(?P<name>country|region)(?P<separator>[-_=])"
     r"(?P<value>[a-z]{2}(?:,[a-z]{2})*)"
+)
+SESSION_SELECTOR_RE = re.compile(
+    r"(?i)(?P<prefix>(?:^|-)session-)(?P<value>[a-z0-9_]+)(?=-|$)"
 )
 DATAIMPULSE_COUNTRY_SELECTOR_RE = re.compile(
     r"(?i)(?P<prefix>__cr[._-])(?P<value>[a-z]{2}(?:,[a-z]{2})*)"
@@ -470,6 +473,19 @@ def _strip_conflicting_geo_selectors(value: str) -> str:
     return DATAIMPULSE_CONFLICTING_GEO_SELECTOR_RE.sub("", value)
 
 
+def _regionalize_sticky_session(value: str, country: str) -> str:
+    """Derive one stable sticky session per country from the supplied seed."""
+    suffix = str(country or "").strip().lower()
+    if len(suffix) != 2:
+        return value
+
+    def replace(match: re.Match[str]) -> str:
+        seed = match.group("value")
+        return f"{match.group('prefix')}{seed}{suffix}"
+
+    return SESSION_SELECTOR_RE.sub(replace, value, count=1)
+
+
 def _proxy_url_with_credentials(
     parsed: Any,
     username: str,
@@ -509,6 +525,7 @@ def _proxy_for_country(proxy_url: str, country: str) -> str:
             "kakao_proxy_country_selector_required",
             "Proxy URL must include a country or region selector",
         )
+    username = _regionalize_sticky_session(username, country)
     password = (
         unquote(parsed.password)
         if parsed.password is not None
@@ -532,6 +549,11 @@ def _proxy_chain_key(proxy_url: str) -> str:
     username = DATAIMPULSE_COUNTRY_SELECTOR_RE.sub(
         lambda match: f"{match.group('prefix')}*",
         username,
+    )
+    username = SESSION_SELECTOR_RE.sub(
+        lambda match: f"{match.group('prefix')}*",
+        username,
+        count=1,
     )
     password = (
         unquote(parsed.password)

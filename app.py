@@ -29,6 +29,7 @@ from provider_checkout import (
     stripe_to_provider,
 )
 from kakao_checkout import (
+    DEFAULT_OPERATION_TIMEOUT as DEFAULT_KAKAO_WORKER_TIMEOUT,
     KakaoWorkerError,
     extract_kakao_link,
     is_allowed_kakao_qr,
@@ -981,6 +982,11 @@ class JobStore:
                 return
             link_type = str(result.get("link_type") or "").lower()
             validate_provider_result(link_type, result)
+            # Kakao provider URLs are short-lived payment capabilities. The
+            # active job returns them to the caller, but stale copies are not
+            # useful after restart and should not be stored indefinitely.
+            if link_type == "kakao":
+                return
             action_kind = ""
             action_value = ""
             if link_type == "upi":
@@ -1406,7 +1412,10 @@ class JobStore:
             token,
             entry_proxy,
             route=str(options.get("kakao_route") or "reference"),
-            timeout=float(options.get("kakao_worker_timeout") or 180),
+            timeout=float(
+                options.get("kakao_worker_timeout")
+                or DEFAULT_KAKAO_WORKER_TIMEOUT
+            ),
             cancel_check=lambda: self.cancelled(job_id),
         )
         self.ensure_not_cancelled(job_id)

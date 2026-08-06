@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
+import socket
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import app as checkout_app
@@ -68,8 +71,11 @@ class KakaoAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(kc.KakaoWorkerError, "kakao_invalid_provider_redirect"):
             kc._map_extract_result({**base, "link": "https://kakaopay.com.attacker.test/x"})
         self.assertTrue(kc.is_allowed_kakao_url(base["link"]))
+        self.assertTrue(kc.is_allowed_kakao_url("https://pay.kakaopay.com:443/x"))
         self.assertFalse(kc.is_allowed_kakao_url("http://pay.kakaopay.com/x"))
         self.assertFalse(kc.is_allowed_kakao_url("https://evil.kakaopay.com/x"))
+        self.assertFalse(kc.is_allowed_kakao_url("https://pay.kakaopay.com:4444/x"))
+        self.assertFalse(kc.is_allowed_kakao_url("https://pay.kakaopay.com:99999/x"))
         self.assertTrue(kc.is_allowed_kakao_qr("data:image/png;base64,AA=="))
 
 
@@ -150,7 +156,14 @@ class KakaoResultValidationTests(unittest.TestCase):
             "promo_requested": True,
             "promo_applied": True,
         }
-        with patch.object(checkout_app, "extract_kakao_link", return_value=mapped):
+        captured: dict = {}
+
+        def extract(*_args: object, **kwargs: object) -> dict:
+            captured.update(kwargs)
+            return mapped
+
+        with patch.object(checkout_app, "extract_kakao_link", side_effect=extract), \
+             patch.object(checkout_app, "DEFAULT_KAKAO_WORKER_TIMEOUT", 321):
             store._run_kakao_single(
                 "job-kakao",
                 {"kakao_route": "reference"},
@@ -163,6 +176,24 @@ class KakaoResultValidationTests(unittest.TestCase):
         self.assertEqual(updates[-1]["status"], "done")
         self.assertNotIn("payment_method_id", updates[-1]["result"])
         self.assertEqual(updates[-1]["result"]["link_type"], "kakao")
+        self.assertEqual(captured["timeout"], 321.0)
+
+    def test_kakao_success_link_is_not_persisted(self) -> None:
+        valid = {
+            "link_type": "kakao",
+            "checkout_amount": 0,
+            "checkout_currency": "KRW",
+            "provider_redirect_url": "https://pay.kakaopay.com/checkout/abc",
+            "promo_requested": True,
+            "promo_applied": True,
+        }
+        with TemporaryDirectory() as tempdir, patch.object(
+            checkout_app,
+            "ROOT",
+            Path(tempdir),
+        ):
+            checkout_app.STORE._record_success("job-kakao", valid)
+            self.assertFalse((Path(tempdir) / "data" / "success_links.jsonl").exists())
 
 
 class KakaoWorkerSourceTests(unittest.TestCase):
@@ -175,22 +206,87 @@ class KakaoWorkerSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(kc.KakaoWorkerError, "kakao_access_token_required"):
             kc._run_worker({"protocol_version": 1}, timeout=5)
 
-    def test_stripe_pin_keeps_hostname_verification(self) -> None:
-        from curl_cffi.requests import Session
-        from curl_cffi import CurlOpt
+    def test_worker_boundary_removes_payment_method_id(self) -> None:
         import kakao_worker
 
-        session = Session(impersonate="chrome136")
-        try:
-            with kakao_worker._stripe_pinned_tls(session, "api.stripe.com", "1.1.1.1"):
-                self.assertEqual(session.curl_options[CurlOpt.SSL_VERIFYHOST], 2)
-                self.assertEqual(
-                    session.curl_options[CurlOpt.RESOLVE],
-                    ["api.stripe.com:443:1.1.1.1"],
-                )
-        finally:
-            session.close()
-        self.assertEqual(session.curl_options, {})
+        now = datetime.now(timezone.utc)
+        request = {
+            "protocol_version": 1,
+            "operation": "extract",
+            "route": "reference",
+            "proxy_url": "http://user-country-kr:secret@gateway.test:6060",
+            "requested_at": now.isoformat(),
+            "deadline": (now + timedelta(minutes=1)).isoformat(),
+            "access_token": "test-token",
+            "trial_eligibility_confirmed": True,
+        }
+        worker_result = {
+            "link": "https://pay.kakaopay.com/checkout/abc",
+            "qr_text": "https://pay.kakaopay.com/checkout/abc",
+            "checkout_session_id": "cs_test_kakao",
+            "payment_method_id": "pm_private",
+            "amount": 0,
+            "currency": "KRW",
+        }
+        with patch.object(kakao_worker, "_load_curl_requests", return_value=object()), \
+             patch.object(kakao_worker, "extract_kakao_link", return_value=worker_result):
+            result = kakao_worker._run(json.dumps(request))
+        self.assertNotIn("payment_method_id", result)
+
+    def test_stripe_pin_changes_proxy_connect_target_and_keeps_sni(self) -> None:
+        import kakao_worker
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(5)
+        proxy_port = server.getsockname()[1]
+        captured: dict[str, object] = {}
+
+        def capture_proxy() -> None:
+            try:
+                connection, _ = server.accept()
+                connect_request = connection.recv(4096)
+                captured["connect"] = connect_request.split(b"\r\n", 1)[0]
+                connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                client_hello = connection.recv(8192)
+                captured["sni"] = b"api.stripe.com" in client_hello
+                connection.close()
+            finally:
+                server.close()
+
+        thread = threading.Thread(target=capture_proxy, daemon=True)
+        thread.start()
+        client = kakao_worker.KakaoHttpClient(
+            f"http://127.0.0.1:{proxy_port}",
+            {"api.stripe.com": "1.1.1.1"},
+        )
+        with patch.object(kakao_worker, "_DEADLINE_TS", time.time() + 5):
+            try:
+                with self.assertRaises(kakao_worker.WorkerFailure):
+                    client.request(
+                        "GET",
+                        "https://api.stripe.com/v1/test",
+                        stage="stripe_connect_test",
+                        timeout=3,
+                    )
+            finally:
+                client.close()
+        thread.join(timeout=5)
+        self.assertEqual(captured.get("connect"), b"CONNECT 1.1.1.1:443 HTTP/1.1")
+        self.assertIs(captured.get("sni"), True)
+        self.assertEqual(client.session.curl_options, {})
+
+    def test_worker_redirect_rejects_non_default_https_ports(self) -> None:
+        import kakao_worker
+
+        for url in (
+            "https://pay.kakaopay.com:4444/x",
+            "https://pay.kakaopay.com:99999/x",
+        ):
+            with self.assertRaises(kakao_worker.WorkerFailure) as raised:
+                kakao_worker._validate_redirect_url(url, final=True)
+            self.assertEqual(raised.exception.code, "kakao_invalid_link")
 
 
 if __name__ == "__main__":

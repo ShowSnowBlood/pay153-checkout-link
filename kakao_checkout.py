@@ -209,6 +209,7 @@ def _epoch_timestamp(value: Any) -> float | None:
 def _is_allowed_provider_url(value: Any) -> bool:
     try:
         parsed = urlsplit(str(value or ""))
+        port = parsed.port
     except ValueError:
         return False
     host = (parsed.hostname or "").lower().rstrip(".")
@@ -218,6 +219,7 @@ def _is_allowed_provider_url(value: Any) -> bool:
         and not parsed.password
         and bool(host)
         and host in PROVIDER_ALLOWED_HOSTS
+        and port in (None, 443)
     )
 
 
@@ -374,6 +376,7 @@ def extract_kakao_link(
 
 
 __all__ = [
+    "DEFAULT_OPERATION_TIMEOUT",
     "KakaoWorkerError",
     "extract_kakao_link",
     "is_allowed_kakao_qr",

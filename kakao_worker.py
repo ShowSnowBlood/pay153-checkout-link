@@ -195,6 +195,7 @@ DATAIMPULSE_CONFLICTING_GEO_SELECTOR_RE = re.compile(
 PROCESSOR_ENTITY_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 _CURL_REQUESTS: Any = None
+_KAKAO_CURL_CLASS: Any = None
 _DEADLINE_TS = 0.0
 
 
@@ -287,6 +288,71 @@ def _load_curl_requests() -> Any:
         ) from exc
     _CURL_REQUESTS = curl_requests
     return _CURL_REQUESTS
+
+
+def _load_kakao_curl_class() -> Any:
+    """Return a Curl subclass that correctly handles CONNECT_TO string lists."""
+    global _KAKAO_CURL_CLASS
+    if _KAKAO_CURL_CLASS is not None:
+        return _KAKAO_CURL_CLASS
+    try:
+        from curl_cffi import CurlOpt
+        from curl_cffi.curl import Curl, ffi, lib
+    except ImportError as exc:
+        raise WorkerFailure(
+            "kakao_dependency_invalid",
+            "curl_cffi does not expose required connection controls",
+        ) from exc
+
+    class KakaoCurl(Curl):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._kakao_connect_to = ffi.NULL
+
+        def setopt(self, option: Any, value: Any) -> int:
+            if option != CurlOpt.CONNECT_TO:
+                return super().setopt(option, value)
+            if self._curl is None:
+                return 0
+            values = [value] if isinstance(value, (str, bytes)) else list(value)
+            if self._kakao_connect_to != ffi.NULL:
+                lib.curl_slist_free_all(self._kakao_connect_to)
+                self._kakao_connect_to = ffi.NULL
+            for item in values:
+                encoded = item.encode() if isinstance(item, str) else item
+                self._kakao_connect_to = lib.curl_slist_append(
+                    self._kakao_connect_to,
+                    encoded,
+                )
+            ret = lib._curl_easy_setopt(
+                self._curl,
+                option,
+                self._kakao_connect_to,
+            )
+            self._check_error(ret, "setopt", option, value)
+            return ret
+
+        def _clear_connect_to(self) -> None:
+            if self._kakao_connect_to != ffi.NULL:
+                lib.curl_slist_free_all(self._kakao_connect_to)
+                self._kakao_connect_to = ffi.NULL
+
+        def clean_handles_and_buffers(
+            self,
+            clear_headers: bool = True,
+            clear_resolve: bool = True,
+        ) -> None:
+            try:
+                super().clean_handles_and_buffers(clear_headers, clear_resolve)
+            finally:
+                self._clear_connect_to()
+
+        def reset(self) -> None:
+            super().reset()
+            self._clear_connect_to()
+
+    _KAKAO_CURL_CLASS = KakaoCurl
+    return _KAKAO_CURL_CLASS
 
 
 def normalize_access_token(raw: Any) -> str:
@@ -535,10 +601,10 @@ def _stripe_pinned_tls(session: Any, hostname: str, target_ip: str):
     session.curl_options = {
         **previous_options,
         CurlOpt.SSL_VERIFYPEER: 1,
-        # Keep the hostname for SNI/certificate verification while pinning the
-        # connection to the DoH-validated address.
+        # CONNECT_TO changes the proxy CONNECT target while the request URL
+        # keeps the Stripe hostname for SNI and certificate verification.
         CurlOpt.SSL_VERIFYHOST: 2,
-        CurlOpt.RESOLVE: [f"{hostname}:443:{address}"],
+        CurlOpt.CONNECT_TO: [f"{hostname}:443:{address}:443"],
     }
     try:
         yield
@@ -557,7 +623,11 @@ class KakaoHttpClient:
         if not self.proxy_url:
             raise WorkerFailure("kakao_proxy_required", "Proxy URL is required")
         try:
-            self.session = _load_curl_requests().Session(impersonate="chrome136")
+            self.session = _load_curl_requests().Session(
+                curl=_load_kakao_curl_class()(),
+                use_thread_local_curl=False,
+                impersonate="chrome136",
+            )
         except WorkerFailure:
             raise
         except Exception as exc:
@@ -1614,6 +1684,7 @@ def _host_matches(host: str, allowed_hosts: frozenset[str]) -> bool:
 def _validate_redirect_url(url: str, *, final: bool) -> str:
     try:
         parsed = urlsplit(str(url or "").strip())
+        port = parsed.port
     except ValueError as exc:
         raise WorkerFailure(
             "kakao_invalid_link",
@@ -1628,6 +1699,7 @@ def _validate_redirect_url(url: str, *, final: bool) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or not _host_matches(parsed.hostname, allowed_hosts)
+        or port not in (None, 443)
     ):
         raise WorkerFailure(
             "kakao_invalid_link",
@@ -1867,7 +1939,6 @@ def extract_kakao_link(
             "link": link,
             "qr_text": link,
             "checkout_session_id": checkout_id,
-            "payment_method_id": payment_method_id,
             "amount": amount,
             "currency": "KRW",
         }
@@ -1966,6 +2037,7 @@ def _run(raw: str) -> dict[str, Any]:
         proxy_route,
         trial_eligibility_confirmed=True,
     )
+    result.pop("payment_method_id", None)
     generated_at = datetime.now(timezone.utc)
     result["generated_at"] = _format_timestamp(generated_at)
     result["expires_at"] = _format_timestamp(generated_at + LINK_VALIDITY)

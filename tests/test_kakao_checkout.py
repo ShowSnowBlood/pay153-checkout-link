@@ -250,6 +250,112 @@ class KakaoWorkerSourceTests(unittest.TestCase):
             kakao_worker._proxy_chain_key(promotion),
         )
 
+    def test_proxy_connect_failure_retries_before_request_is_sent(self) -> None:
+        import kakao_worker
+
+        class Response:
+            status_code = 200
+            text = '{"ok":true}'
+            headers = {"content-type": "application/json"}
+
+        class Session:
+            curl_options: dict = {}
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, *_args: object, **_kwargs: object) -> Response:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(
+                        "curl: (28) Failed to connect to gateway.test:6060: "
+                        "Could not connect to server"
+                    )
+                return Response()
+
+        client = kakao_worker.KakaoHttpClient.__new__(kakao_worker.KakaoHttpClient)
+        client.proxy_url = "http://gateway.test:6060"
+        client.stripe_targets = {}
+        client.session = Session()
+        with patch.object(kakao_worker, "_DEADLINE_TS", time.time() + 5), \
+             patch.object(kakao_worker, "_sleep") as sleep:
+            status, text, _ = client.request(
+                "POST",
+                "https://chatgpt.com/backend-api/payments/checkout",
+                stage="kr_bootstrap_init",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(text, '{"ok":true}')
+        self.assertEqual(client.session.calls, 2)
+        sleep.assert_called_once()
+
+    def test_non_connect_failure_is_not_retried(self) -> None:
+        import kakao_worker
+
+        class Session:
+            curl_options: dict = {}
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, *_args: object, **_kwargs: object) -> object:
+                self.calls += 1
+                raise RuntimeError("curl: (28) Operation timed out after 30000 ms")
+
+        client = kakao_worker.KakaoHttpClient.__new__(kakao_worker.KakaoHttpClient)
+        client.proxy_url = "http://gateway.test:6060"
+        client.stripe_targets = {}
+        client.session = Session()
+        with patch.object(kakao_worker, "_DEADLINE_TS", time.time() + 5), \
+             self.assertRaises(kakao_worker.WorkerFailure):
+            client.request(
+                "POST",
+                "https://chatgpt.com/backend-api/payments/checkout",
+                stage="kr_bootstrap_init",
+            )
+        self.assertEqual(client.session.calls, 1)
+
+    def test_approval_failure_preserves_safe_reason_code(self) -> None:
+        import kakao_worker
+
+        with patch.object(
+            kakao_worker,
+            "_request_required_json",
+            return_value={"result": "denied", "error": {"code": "risk_rejected"}},
+        ), patch.object(kakao_worker, "_sleep"), self.assertRaises(
+            kakao_worker.WorkerFailure
+        ) as raised:
+            kakao_worker._approve_checkout(
+                object(),
+                "access-token",
+                "cs_test_checkout",
+                "openai_llc",
+            )
+        self.assertEqual(raised.exception.code, "kakao_approval_failed")
+        self.assertIn("risk_rejected", raised.exception.message)
+
+    def test_billing_reuses_account_identity_and_is_stable(self) -> None:
+        import kakao_worker
+
+        def encode(value: dict) -> str:
+            return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+        token = (
+            f"{encode({'alg': 'none'})}."
+            f"{encode({
+                'https://api.openai.com/auth': {'chatgpt_account_id': 'acct_test'},
+                'https://api.openai.com/profile': {
+                    'name': 'Haruto Sato',
+                    'email': 'account@example.com',
+                },
+            })}.signature"
+        )
+        first = kakao_worker._random_billing(token)
+        second = kakao_worker._random_billing(token)
+        self.assertEqual(first["name"], "Haruto Sato")
+        self.assertEqual(first["email"], "account@example.com")
+        self.assertEqual(first, second)
+
     def test_stripe_pin_changes_proxy_connect_target_and_keeps_sni(self) -> None:
         import kakao_worker
 

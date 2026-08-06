@@ -32,6 +32,8 @@ LINK_VALIDITY = timedelta(minutes=15)
 MAX_CLOCK_SKEW = timedelta(seconds=5)
 HTTP_TIMEOUT = 30.0
 PREFLIGHT_TIMEOUT = 12.0
+PROXY_CONNECT_RETRIES = 2
+PROXY_CONNECT_BACKOFF = 0.35
 REDIRECT_POLL_TIMEOUT = 120.0
 MAX_APPROVE_ATTEMPTS = 3
 MAX_REDIRECT_HOPS = 6
@@ -356,6 +358,21 @@ def _load_kakao_curl_class() -> Any:
 
     _KAKAO_CURL_CLASS = KakaoCurl
     return _KAKAO_CURL_CLASS
+
+
+def _is_proxy_connect_failure(exc: Exception) -> bool:
+    """Return whether curl failed before reaching the upstream request target."""
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "failed to connect to",
+            "could not connect to server",
+            "couldn't connect to server",
+            "connection to proxy closed",
+            "proxy connect aborted",
+        )
+    )
 
 
 def normalize_access_token(raw: Any) -> str:
@@ -704,19 +721,34 @@ class KakaoHttpClient:
         if target_ip:
             request_redirects = False
         try:
-            with _stripe_pinned_tls(self.session, hostname, target_ip) if target_ip else _null_context():
-                response = self.session.request(
-                    method.upper(),
-                    request_url,
-                    headers=request_headers,
-                    json=json_body,
-                    data=form,
-                    params=params,
-                    timeout=_remaining_seconds(timeout),
-                    allow_redirects=request_redirects,
-                    impersonate="chrome136",
-                    proxies={"http": self.proxy_url, "https": self.proxy_url},
-                    verify=True if target_ip else None,
+            response = None
+            for attempt in range(PROXY_CONNECT_RETRIES + 1):
+                try:
+                    with _stripe_pinned_tls(self.session, hostname, target_ip) if target_ip else _null_context():
+                        response = self.session.request(
+                            method.upper(),
+                            request_url,
+                            headers=request_headers,
+                            json=json_body,
+                            data=form,
+                            params=params,
+                            timeout=_remaining_seconds(timeout),
+                            allow_redirects=request_redirects,
+                            impersonate="chrome136",
+                            proxies={"http": self.proxy_url, "https": self.proxy_url},
+                            verify=True if target_ip else None,
+                        )
+                    break
+                except Exception as exc:
+                    if attempt >= PROXY_CONNECT_RETRIES or not _is_proxy_connect_failure(exc):
+                        raise
+                    _sleep(PROXY_CONNECT_BACKOFF * (2**attempt))
+            if response is None:
+                raise WorkerFailure(
+                    "kakao_proxy_request_failed",
+                    "Kakao proxy request failed",
+                    True,
+                    stage=stage,
                 )
             return (
                 int(response.status_code),
@@ -1364,16 +1396,38 @@ def _update_checkout_promotion(
         )
 
 
-def _random_billing() -> dict[str, str]:
-    rng = random.SystemRandom()
+def _account_profile(access_token: str) -> dict[str, str]:
+    profile = _jwt_payload(access_token).get("https://api.openai.com/profile") or {}
+    if not isinstance(profile, dict):
+        return {}
+    name = str(profile.get("name") or "").strip()
+    email = str(profile.get("email") or "").strip().lower()
+    if len(name) > 120:
+        name = ""
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or len(email) > 254:
+        email = ""
+    return {"name": name, "email": email}
+
+
+def _random_billing(access_token: str = "") -> dict[str, str]:
+    profile = _account_profile(access_token)
+    identity_seed = profile.get("email") or _jwt_account_id(access_token)
+    if identity_seed:
+        seed = int.from_bytes(hashlib.sha256(identity_seed.encode("utf-8")).digest()[:8], "big")
+        rng: random.Random = random.Random(seed)
+    else:
+        rng = random.SystemRandom()
     address = rng.choice(SEOUL_ADDRESS_SEEDS)
-    name = f"{rng.choice(KOREAN_FAMILY_NAMES)}{rng.choice(KOREAN_GIVEN_NAMES)}"
-    local_name = hashlib.sha256(f"{name}:{uuid.uuid4()}".encode("utf-8")).hexdigest()[
-        :10
-    ]
+    name = profile.get("name") or f"{rng.choice(KOREAN_FAMILY_NAMES)}{rng.choice(KOREAN_GIVEN_NAMES)}"
+    email = profile.get("email")
+    if not email:
+        local_name = hashlib.sha256(
+            f"{name}:{identity_seed or uuid.uuid4()}".encode("utf-8")
+        ).hexdigest()[:10]
+        email = f"{local_name}@{rng.choice(EMAIL_DOMAINS)}"
     return {
         "name": name,
-        "email": f"{local_name}@{rng.choice(EMAIL_DOMAINS)}",
+        "email": email,
         "line1": f"{address['road']} {address['base'] + rng.randrange(address['span'])}",
         "line2": "",
         "city": "서울특별시",
@@ -1621,12 +1675,29 @@ def _confirm_payment(
     return redirect
 
 
+def _approval_failure_reason(payload: dict[str, Any]) -> str:
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    candidates = (
+        error.get("code"),
+        error.get("type"),
+        payload.get("code"),
+        payload.get("result"),
+        payload.get("status"),
+    )
+    for value in candidates:
+        reason = str(value or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", reason):
+            return reason
+    return ""
+
+
 def _approve_checkout(
     client: KakaoHttpClient,
     access_token: str,
     checkout_id: str,
     processor_entity: str,
 ) -> None:
+    last_reason = ""
     for attempt in range(MAX_APPROVE_ATTEMPTS):
         payload = _request_required_json(
             client,
@@ -1649,11 +1720,15 @@ def _approve_checkout(
         )
         if payload.get("result") == "approved":
             return
+        last_reason = _approval_failure_reason(payload) or last_reason
         if attempt + 1 < MAX_APPROVE_ATTEMPTS:
             _sleep(1)
+    message = "Kakao checkout approval failed"
+    if last_reason:
+        message = f"{message} ({last_reason})"
     raise WorkerFailure(
         "kakao_approval_failed",
-        "Kakao checkout approval failed",
+        message,
         True,
         stage="kr_checkout_approve",
     )
@@ -1872,7 +1947,7 @@ def extract_kakao_link(
             "kr_post_promotion_init",
             require_zero=True,
         )
-        billing = _random_billing()
+        billing = _random_billing(access_token)
         tax_elements_session_id = f"elements_session_{uuid.uuid4().hex[:11]}"
         _update_checkout_taxes(
             provider_client,

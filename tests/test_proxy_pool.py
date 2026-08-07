@@ -550,12 +550,15 @@ class ProxyLeaseApiTests(unittest.TestCase):
         self.assertTrue(proxy_pool.is_dynamic_template(captured["entry_proxies"][0]))
         self.assertEqual(captured["promo_proxy_country"], "JP")
 
-    def test_frontend_has_no_proxy_pool_inputs(self) -> None:
+    def test_frontend_sends_only_non_empty_proxy_pool_inputs(self) -> None:
         source = (Path(__file__).parents[1] / "static" / "index.html").read_text(encoding="utf-8")
         script = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertNotIn('id="entryProxy"', source)
-        self.assertNotIn('id="exitProxy"', source)
-        self.assertNotIn("entry_proxies:", script)
+        self.assertIn('id="entryProxy"', source)
+        self.assertIn('id="exitProxy"', source)
+        self.assertIn("if (entryProxies) body.entry_proxies = entryProxies;", script)
+        self.assertIn("if (exitProxies && !$('exitProxyField').hidden) body.exit_proxies = exitProxies;", script)
+        self.assertNotIn("localStorage.setItem('entryProxy'", script)
+        self.assertNotIn("localStorage.setItem('exitProxy'", script)
 
     def test_upi_request_uses_entry_pool_for_both_sides(self) -> None:
         import app as checkout_app

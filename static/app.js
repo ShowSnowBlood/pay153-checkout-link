@@ -54,6 +54,13 @@ function syncFields(applyRailDefault=false){
   if (kakao) $('usePromo').checked = true;
   $('promoLine').style.display = promoSupported ? 'flex' : 'none';
   $('plusPromoFields').hidden = !promoSupported || kakao || !$('usePromo').checked;
+  const needsExitProxy = rail === 'paypal' || (rail === 'upi' && plan === 'plus' && $('usePromo').checked);
+  $('exitProxyField').hidden = !needsExitProxy;
+  $('proxyRouteHint').textContent = kakao
+    ? 'Kakao 会从同一动态网关种子派生 KR / VN / KR 会话，无需单独填写支付代理池。'
+    : needsExitProxy
+      ? '当前通道会区分入口与支付出口；支付代理池留空时由后端沿用默认策略。'
+      : '当前通道使用入口代理完成完整流程；留空时使用后端默认网关。';
   if (applyRailDefault && providerDefaults[rail]) {
     $('country').value = providerDefaults[rail].country;
     $('currency').value = providerDefaults[rail].currency;
@@ -61,6 +68,13 @@ function syncFields(applyRailDefault=false){
 }
 $('country').addEventListener('change', () => $('currency').value = countryCurrency[$('country').value] || 'USD');
 $('usePromo').addEventListener('change', () => syncFields(false));
+
+function updateProxyCount(inputId, countId){
+  const count = $(inputId).value.split(/\r?\n/).filter(line => line.trim()).length;
+  $(countId).textContent = count ? `${count} 条` : '未填写';
+}
+$('entryProxy').addEventListener('input', () => updateProxyCount('entryProxy', 'entryProxyCount'));
+$('exitProxy').addEventListener('input', () => updateProxyCount('exitProxy', 'exitProxyCount'));
 
 function paintProgress(value){
   const p = Math.max(0, Math.min(100, value));
@@ -241,6 +255,10 @@ form.addEventListener('submit', async (event) => {
     pix_tax_id: selected('link_type') === 'pix' ? $('pixTaxId').value.trim() : '',
     pix_auto_kind: selected('link_type') === 'pix' ? $('pixAutoKind').value : 'cpf'
   };
+  const entryProxies = $('entryProxy').value.trim();
+  const exitProxies = $('exitProxy').value.trim();
+  if (entryProxies) body.entry_proxies = entryProxies;
+  if (exitProxies && !$('exitProxyField').hidden) body.exit_proxies = exitProxies;
   try{
     const r = await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const data = await r.json(); if(!r.ok) throw new Error(data.error || `HTTP ${r.status}`);

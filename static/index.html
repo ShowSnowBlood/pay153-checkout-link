@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>PAY.153 · 多通道提链控制台</title>
   <meta name="description" content="Hosted、PayPal、iDEAL、UPI、PIX、KakaoPay、Team 与 Codex 空间提链工作台">
-  <link rel="stylesheet" href="/static/styles.css?v=20260716-neo02">
+  <link rel="stylesheet" href="/static/styles.css?v=20260807-proxy01">
 </head>
 <body>
   <div class="paper-noise"></div>
@@ -92,6 +92,29 @@
         <p id="regionAutoHint" class="region-auto-hint" hidden>PayPal 的国家、地区和币种会根据代理池 2 自动识别。</p>
 
         <label class="field retry-field"><span>失败重试次数 <small>1-50 次</small></span><input id="retryCount" type="number" min="1" max="50" value="10"></label>
+
+        <details class="advanced proxy-settings">
+          <summary>
+            <span class="advanced-title"><b>动态 IP / 代理池</b><small>可选 · 留空使用后端默认网关</small></span>
+            <span class="advanced-indicator" aria-hidden="true">+</span>
+          </summary>
+          <div class="advanced-body">
+            <div class="proxy-grid">
+              <label class="field proxy-field">
+                <span class="label-row"><b>入口代理池</b><small id="entryProxyCount">未填写</small></span>
+                <textarea id="entryProxy" autocomplete="off" spellcheck="false" placeholder="每行一个代理，例如 http://user:password@gateway:6060"></textarea>
+                <span class="field-note">用于账号、资格校验和主流程。支持一行一个代理或动态网关模板。</span>
+              </label>
+              <label id="exitProxyField" class="field proxy-field" hidden>
+                <span class="label-row"><b>支付代理池</b><small id="exitProxyCount">未填写</small></span>
+                <textarea id="exitProxy" autocomplete="off" spellcheck="false" placeholder="每行一个支付出口代理"></textarea>
+                <span class="field-note">用于 PayPal，或开启优惠的 UPI 支付阶段；留空时由后端沿用默认策略。</span>
+              </label>
+            </div>
+            <p id="proxyRouteHint" class="proxy-route-hint">当前通道使用入口代理完成完整流程。Kakao 会从同一动态网关种子派生 KR / VN / KR 会话。</p>
+            <p class="proxy-security-note"><b>仅本次请求</b><span>代理凭据不会写入浏览器本地存储，界面也不会回显或记录内容。</span></p>
+          </div>
+        </details>
 
         <div id="teamFields" class="conditional-fields" hidden>
           <div class="two-cols">
@@ -191,6 +214,6 @@
   </main>
 
   <footer><span>PAY.153.INK</span><p>任务完成后请及时使用链接；支付提供商生成的二维码通常具有有效期。</p></footer>
-  <script src="/static/app.js?v=20260806-kakao01"></script>
+  <script src="/static/app.js?v=20260807-proxy01"></script>
 </body>
 </html>
